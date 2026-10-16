@@ -33,7 +33,12 @@ from evolution.core.config import EvolutionConfig, find_git_repo_root, resolve_s
 from evolution.core.dataset_builder import GoldenDatasetLoader, build_dataset_from_pi_sessions  # noqa: F401
 from evolution.core.constraints import ConstraintValidator
 from evolution.core.fitness import gepa_feedback_metric, skill_fitness_metric  # noqa: F401
-from evolution.skills.skill_module import load_skill, make_skill_module, reassemble_skill
+from evolution.skills.skill_module import (
+    extract_skill_text,
+    load_skill,
+    make_skill_module,
+    reassemble_skill,
+)
 
 console = Console()
 
@@ -165,7 +170,7 @@ def main(skill, iterations, eval_source, dataset_path, hermes_repo, run_tests, d
         optimizer = dspy.MIPROv2(metric=skill_fitness_metric, auto="light")
         optimized = optimizer.compile(baseline_module, trainset=dataset.to_dspy_examples("train"))
 
-    evolved_body = optimized.skill_text
+    evolved_body = extract_skill_text(optimized)
     evolved_full = reassemble_skill(found["frontmatter"], evolved_body)
 
     console.print("[bold]Evolved constraints[/bold]")
