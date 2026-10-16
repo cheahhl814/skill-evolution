@@ -115,11 +115,17 @@ def skill_fitness_metric(example, prediction, trace=None, pred_name=None, pred_t
     return min(1.0, score)
 
 
-def gepa_feedback_metric(example, prediction, trace=None, pred_name=None, pred_trace=None) -> dict:
-    """GEPA feedback metric: score + textual feedback dict per the dspy >=3.4
-    GEPAFeedbackMetric contract. Returns {'score': float, 'feedback': str} —
-    feedback names the rubric elements the response missed so the reflection
-    LM can rewrite the skill instructions toward them."""
+def gepa_feedback_metric(example, prediction, trace=None, pred_name=None, pred_trace=None):
+    """GEPA feedback metric (dspy >=3.4 contract, 5-arg).
+
+    Program level (no pred_name): a plain float — GEPA aggregates program
+    scores arithmetically and crashes on `int + dict` otherwise (observed).
+    Predictor level (pred_name given): {'score', 'feedback'} dict — feedback
+    names the rubric elements the response missed so the reflection LM can
+    rewrite the skill instructions toward them."""
+    score = skill_fitness_metric(example, prediction)
+    if pred_name is None:
+        return score
     agent_output = (getattr(prediction, "output", "") or "").strip()
     expected = (getattr(example, "expected_behavior", "") or "").lower()
     if not agent_output:
@@ -128,7 +134,6 @@ def gepa_feedback_metric(example, prediction, trace=None, pred_name=None, pred_t
                             "no actionable path to follow — make the next step explicit."}
     covered = set(agent_output.lower().split()) & set(expected.split())
     missed = set(expected.split()) - covered
-    score = skill_fitness_metric(example, prediction)
     feedback = (
         f"Heuristic coverage {score:.2f}. The response hit rubric elements like "
         f"{', '.join(sorted(covered)[:8]) or '(none)'}. Missing rubric elements the "
