@@ -1,0 +1,70 @@
+"""Offline tests that need no API keys: parser, constraints, session miner."""
+
+import json
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from evolution.core.config import EvolutionConfig, resolve_skill, find_git_repo_root  # noqa: E402
+from evolution.core.constraints import ConstraintValidator  # noqa: E402
+from evolution.core.fitness import length_penalty, skill_fitness_metric  # noqa: E402
+from evolution.core.pi_sessions import extract_pairs  # noqa: E402
+
+
+def test_length_penalty():
+    assert length_penalty(1000, 15360) == 0.0
+    assert 0 < length_penalty(15000, 15360) <= 0.3
+    assert length_penalty(16000, 15360) == 0.3
+
+
+def test_metric():
+    class P:
+        output = "run the workflow and verify results"
+
+    class E:
+        expected_behavior = "verify results and report evidence"
+
+    s = skill_fitness_metric(E(), P())
+    assert 0.3 <= s <= 1.0
+
+
+def test_constraints_contract():
+    v = ConstraintValidator(EvolutionConfig())
+    good = "---\nname: x\ndescription: Use when testing.\n---\nbody"
+    bad = "no frontmatter"
+    assert all(r.passed for r in v.validate_all(good))
+    assert not v.validate_all(bad)[2].passed
+    r = v.validate_all(good + "x" * 20000)[0]
+    assert not r.passed  # size cap
+
+
+def test_session_parser(tmp_path: Path):
+    f = tmp_path / "s.jsonl"
+    f.write_text("\n".join([
+        json.dumps({"type": "session", "id": "s1", "cwd": "/tmp"}),
+        json.dumps({"type": "message", "message": {"role": "user", "content": [{"type": "text", "text": "forge a skill for QC"}]}}),
+        json.dumps({"type": "model_change", "provider": "x", "modelId": "y"}),
+        json.dumps({"type": "message", "message": {"role": "assistant", "content": [{"type": "text", "text": "Forged."}]}}),
+    ]))
+    pairs = extract_pairs(f)
+    assert len(pairs) == 1 and pairs[0].user_text == "forge a skill for QC"
+
+
+def test_git_root_detection(tmp_path: Path):
+    (tmp_path / ".git").mkdir()
+    sub = tmp_path / "a" / "b"
+    sub.mkdir(parents=True)
+    assert find_git_repo_root(sub) == tmp_path
+    assert find_git_repo_root(Path("/etc")) is None
+
+
+def test_resolve_symlinked_skill(tmp_path: Path):
+    root = tmp_path / "roots"
+    src = tmp_path / "src" / "my-skill"
+    src.mkdir(parents=True)
+    (src / "SKILL.md").write_text("---\nname: my-skill\ndescription: Use when resolving.\n---\nbody")
+    root.mkdir()
+    (root / "my-skill").symlink_to(src)
+    cfg = EvolutionConfig(skills_roots=[root])
+    assert resolve_skill("my-skill", cfg) == (src / "SKILL.md").resolve()
