@@ -104,7 +104,7 @@ def mine_pi_sessions(skill_name: str, limit: int = 200, sessions_root: Optional[
     out: list[SessionPair] = []
     for f in iter_session_files(sessions_root):
         for pair in extract_pairs(f):
-            low = " ".join((pair.user_text + " " + pair.assistant_text)).lower()
+            low = (pair.user_text + " " + pair.assistant_text).lower()
             if any(t in low for t in tokens):
                 out.append(pair)
                 if len(out) >= limit:

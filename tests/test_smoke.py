@@ -68,3 +68,22 @@ def test_resolve_symlinked_skill(tmp_path: Path):
     (root / "my-skill").symlink_to(src)
     cfg = EvolutionConfig(skills_roots=[root])
     assert resolve_skill("my-skill", cfg) == (src / "SKILL.md").resolve()
+
+def test_mine_pi_sessions_finds_token(tmp_path: Path, monkeypatch):
+    """Regression: the heuristic miner used \" \".join(<string>), which
+    space-separates every character and made every token search miss."""
+    import evolution.core.pi_sessions as ps
+
+    d = tmp_path / "s" / "dir"
+    d.mkdir(parents=True)
+    f = d / "2026-01-01.jsonl"
+    f.write_text("\n".join([
+        json.dumps({"type": "session", "id": "s1", "cwd": "/tmp"}),
+        json.dumps({"type": "message", "message": {"role": "user", "content": [{"type": "text", "text": "forge a skill for QC"}]}}),
+        json.dumps({"type": "message", "message": {"role": "assistant", "content": [{"type": "text", "text": "Forged."}]}}),
+    ]))
+    monkeypatch.setattr(ps, "HOME", tmp_path / "s")
+    orig = ps.iter_session_files
+    monkeypatch.setattr(ps, "iter_session_files", lambda root=None: iter([f]))
+    pairs = ps.mine_pi_sessions("skill-forge")
+    assert len(pairs) == 1
