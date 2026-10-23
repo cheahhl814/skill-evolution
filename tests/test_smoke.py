@@ -87,3 +87,19 @@ def test_mine_pi_sessions_finds_token(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(ps, "iter_session_files", lambda root=None: iter([f]))
     pairs = ps.mine_pi_sessions("skill-forge")
     assert len(pairs) == 1
+
+
+def test_mined_sessions_dataset_uses_sessionpair(tmp_path, monkeypatch):
+    """Regression: mine_pi_sessions returns SessionPair dataclasses; the
+    sessions dataset builder used to unpack them as (meta, user, assistant)
+    triples after the 3f1b07c redesign and crashed with TypeError."""
+    import evolution.core.dataset_builder as db
+    from evolution.core.pi_sessions import SessionPair
+
+    pair = SessionPair("s1", "/tmp", "2026-01-01", "forge a skill", "ok")
+    monkeypatch.setattr(db, "mine_pi_sessions", lambda name, limit=200: [pair])
+    ds = db.build_dataset_from_pi_sessions("skill-forge", "body", judge=False)
+    # a single mined pair is duplicated across splits (_default_split), so
+    # assert on content rather than count
+    assert ds.all_examples, "dataset must retain the mined pair"
+    assert all("forge a skill" in e.task_input for e in ds.all_examples)

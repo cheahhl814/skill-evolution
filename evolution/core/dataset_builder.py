@@ -198,8 +198,8 @@ def build_dataset_from_pi_sessions(
     if not pairs:
         return EvalDataset()
     examples = []
-    for _meta, user_text, _assistant in pairs:
-        user_text = scrub_secrets(user_text)
+    for pair in pairs:
+        user_text = scrub_secrets(pair.user_text)
         if not judge:
             # Heuristic rubric: the skill name/topic plus "session succeeded" proxy
             examples.append(
