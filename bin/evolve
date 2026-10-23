@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# skill-evolution — Layer-2 offline optimizer wrapper. Run from anywhere:
+#   bin/evolve --skill <name> --eval-source sessions --dry-run
+set -euo pipefail
+DIR="$(dirname "$(readlink -f "$0")")"
+ROOT="$(readlink -f "$DIR/..")"
+cd "$ROOT"
+if [ ! -f .venv/bin/activate ]; then
+    echo "venv missing — run: uv venv && uv pip install -e '.[evolution,dev]'" >&2
+    exit 1
+fi
+# shellcheck disable=SC1091
+source .venv/bin/activate
+exec python -m evolution.skills.evolve_skill "$@"

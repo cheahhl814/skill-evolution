@@ -1,2 +1,14 @@
 output/
 __pycache__/
+# Layer-2 runtime data (regenerated per machine; never ship)
+.venv/
+.pytest_cache/
+
+# skill-forge run artifacts (per run; never committed)
+skill-built.md
+battle-test-report.md
+battle-test_evidence.txt
+preflight.md
+preflight_evidence.txt
+debug-report.md
+tool-inventory.json
