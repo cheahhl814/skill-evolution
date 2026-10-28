@@ -2,7 +2,7 @@
   "skill_name": "skill-evolution",
   "skill_title": "Skill Self-Improvement — Layer 1 runtime + monitor/triage + Layer 2 offline optimizer for Pi skills",
   "skill_description": "Two-layer self-improvement for Pi skills: Layer 1 runtime skill_manage extension with per-skill usage telemetry, a session-end triage digest and a prompt suggestion naming the next target, a monitor/triage step that ranks which skill to evolve first, and Layer 2 offline DSPy+GEPA optimization of SKILL.md bodies, constraint-gated, human-reviewed.",
-  "skill_version": "1.4.0",
+  "skill_version": "1.5.0",
   "skill_updated": "2026-10-28",
   "skill_triggers": ["evolve a skill", "optimize skill", "layer-2 evolution", "skill evolution", "GEPA", "skill_manage", "which skill should I evolve", "skill usage telemetry", "triage digest"],
   "run_dir": "/home/cheahhl814/claude_workspace/bioinformatics/AIx-BIO/skills/skill-evolution",
@@ -53,7 +53,8 @@
       "role": "offline evolution — DSPy+GEPA optimizer over SKILL.md bodies",
       "source": "evolution/",
       "entrypoint": "bin/evolve",
-      "structural_gate": "skill-forge bin/skill-lint.py (auto-detected)"
+      "structural_gate": "skill-forge bin/skill-lint.py (auto-detected)",
+      "command_gate": "bin/smoke-candidate (opt-in via --smoke): runs the candidate's allowlisted shell commands and rejects one whose commands break"
     }
   },
   "generated": "2026-10-23T14:4x:00+08:00"

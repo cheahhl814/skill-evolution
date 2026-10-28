@@ -103,7 +103,8 @@ def deploy(skill_name: str, skill: dict, evolved_full: str, output_dir: Path) ->
 @click.option("--hermes-repo", default=None, hidden=True)
 @click.option("--run-tests", is_flag=True, help="Run the skill source tree's pytest as a hard gate")
 @click.option("--dry-run", is_flag=True, help="Validate setup (find, load, constraints, dataset heuristic count) without API calls")
-def main(skill, iterations, eval_source, dataset_path, hermes_repo, run_tests, dry_run):
+@click.option("--smoke", is_flag=True, help="Run the command smoke gate on the candidate (bin/smoke-candidate): a candidate whose commands do not run is rejected before deploy")
+def main(skill, iterations, eval_source, dataset_path, hermes_repo, run_tests, dry_run, smoke):
     config = EvolutionConfig()
     skill_path = resolve_skill(skill, config)
     if not skill_path:
@@ -218,6 +219,42 @@ def main(skill, iterations, eval_source, dataset_path, hermes_repo, run_tests, d
         return
 
     (out_dir / "evolved_skill.md").write_text(evolved_full)
+
+    # ── optional command smoke gate ──────────────────────────────────────
+    # Lint checks the skill's STRUCTURE; it cannot check that the commands the
+    # skill tells the agent to run actually work. A candidate can pass every
+    # constraint, beat the baseline, and still contain a command that fails
+    # when executed (observed: `date -d "2024-03-15" +%V / %G` -> "extra
+    # operand '/'"). The gate extracts the commands, runs the allowlisted
+    # ones, and rejects the candidate if any of them fail.
+    if smoke:
+        gate = Path(__file__).resolve().parents[2] / "bin" / "smoke-candidate"
+        if gate.exists():
+            import subprocess
+
+            proc = subprocess.run(
+                ["bash", str(gate), str(out_dir / "evolved_skill.md"), "--json"],
+                capture_output=True,
+                text=True,
+                timeout=300,
+            )
+            try:
+                report = json.loads(proc.stdout or "{}")
+            except ValueError:
+                report = {}
+            failed = report.get("failed", 0)
+            if proc.returncode != 0:
+                console.print(f"[red]✗ smoke gate: {failed} command(s) in the candidate do not run[/red]")
+                for r in report.get("results", []):
+                    if r.get("status") == "FAIL":
+                        console.print(f"    [red]{r.get('command')}[/red] -> {r.get('stderr', '')[:120]}")
+                (out_dir / "evolved_skill.md").rename(out_dir / "evolved_FAILED_smoke.md")
+                console.print(f"[red]✗ candidate rejected by the smoke gate — saved for inspection: {out_dir / 'evolved_FAILED_smoke.md'}[/red]")
+                raise SystemExit(1)
+            console.print(f"[green]✓ smoke gate: {report.get('total', 0)} command(s) checked, all ran[/green]")
+        else:
+            console.print("[yellow]⚠ smoke gate requested but bin/smoke-candidate is missing — skipped[/yellow]")
+
     console.print(deploy(skill, found, evolved_full, out_dir))
     console.print("[green]✓ deployed for human review (nothing pushed, nothing applied to other skills)[/green]")
 

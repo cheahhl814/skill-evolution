@@ -1,0 +1,175 @@
+#!/usr/bin/env bash
+# skill-evolution — candidate smoke gate.
+#
+# Lint checks the SKILL.md's *structure*; it cannot check that the commands the
+# skill tells the agent to run actually work. A candidate can pass lint with a
+# broken command and a green score. This gate extracts the shell commands from
+# a skill body, substitutes the placeholders, runs each one, and fails on any
+# non-zero exit (except the deliberate leap-year probe, whose error IS the
+# expected answer).
+#
+#   bin/smoke-candidate <skill.md> [--json]
+#
+# Exit codes: 0 = all commands ran, 1 = at least one failed, 2 = bad usage.
+set -uo pipefail
+
+usage() {
+	echo "usage: bin/smoke-candidate <skill.md> [--json]" >&2
+	exit 2
+}
+
+FILE=""
+JSON=0
+for arg in "$@"; do
+	case "$arg" in
+	--json) JSON=1 ;;
+	-*) usage ;;
+	*) [ -z "$FILE" ] && FILE="$arg" || usage ;;
+	esac
+done
+[ -n "$FILE" ] || usage
+[ -f "$FILE" ] || {
+	echo "smoke-candidate: no such file: $FILE" >&2
+	exit 2
+}
+
+python3 - "$FILE" "$JSON" <<'PY'
+import json
+import re
+import subprocess
+import sys
+
+path, as_json = sys.argv[1], sys.argv[2] == "1"   # the shell passes "1" for --json
+text = open(path, encoding="utf-8", errors="ignore").read()
+
+# Collect command-looking snippets from inline code spans and fenced blocks.
+# Each snippet keeps the line it came from, so we can tell a real command
+# from a template or from a deliberately-wrong "negative example".
+snippets = {}
+def _add(cmd, line):
+    snippets.setdefault(cmd, line)
+
+for line in text.splitlines():
+    for m in re.finditer(r"`([^`\n]{3,200})`", line):
+        s = m.group(1).strip()
+        if re.match(r"^(date|ncal|cal|echo \$\(\()(\s|$)", s):
+            _add(s, line)
+for m in re.finditer(r"```(?:bash|sh|shell)?\n(.*?)```", text, re.S):
+    for line in m.group(1).splitlines():
+        s = line.strip().lstrip("$ ").strip()
+        if re.match(r"^(date|ncal|cal|echo \$\(\()(\s|$)", s):
+            _add(s, line)
+
+# A command shown as WRONG on purpose (e.g. "the unquoted form does not work")
+# must not be reported as a defect.
+NEGATIVE_MARKERS = ("is not", "isn't", "wrong", "incorrect", "fails with", "not correct", "do not use", "invalid")
+
+# Placeholders that cannot be substituted -> the snippet is a template, not a
+# runnable command. Templates are skipped, never failed.
+TEMPLATE_MARKERS = ("YYYY", "expression", "@<", "<epoch", "DateA", "DateB", '"fmt"', '"str"', "+Nd", "X +", '"date"')
+
+# BSD-only date forms: valid on macOS, meaningless on GNU/Linux.
+BSD_MARKERS = ("date -j", "date -v", "date -u -r", " -j -f", " -v ")
+
+# SAFETY: the body under test is LLM-authored text. Only allowlisted,
+# side-effect-free binaries may be executed, and only when the command has no
+# shell metacharacters that could smuggle in another program. Anything else is
+# skipped, never run.
+ALLOWED_BINARIES = ("date", "cal", "ncal", "echo")
+SAFE_META = ("`", "$(", ";", "&&", "||", "|", ">", "<", "&", "rm ", "curl ", "wget ", "sudo ")
+
+
+def _is_safe(cmd: str) -> bool:
+    """True when the command is an allowlisted binary with no metacharacters."""
+    if not cmd.startswith(ALLOWED_BINARIES):
+        return False
+    # `echo $(( ... ))` is safe arithmetic and is the one metacharacter form
+    # we deliberately allow.
+    if re.match(r"^echo \$\(\(.*\)\)$", cmd):
+        return True
+    if "$((" in cmd:  # the arithmetic form above, but with extra text
+        return False
+    # `2>&1` (merge stderr into stdout) is a benign redirection, not a way to
+    # smuggle in another program — judge safety on the command without it.
+    probe = cmd.replace("2>&1", "").replace("1>&2", "")
+    for meta in SAFE_META:
+        if meta in probe:
+            return False
+    return True
+
+# Placeholder -> concrete value, so a template command becomes runnable.
+SUBS = [
+    (r"YYYY-MM-DD", "2024-03-15"),
+    (r'"DateB"', '"2026-03-15"'),
+    (r'"DateA"', '"2026-01-15"'),
+    (r"\bDateB\b", "2026-03-15"),
+    (r"\bDateA\b", "2026-01-15"),
+    (r"\bYYYY\b", "2024"),
+    (r"@timestamp", "@1700000000"),
+    (r"\btimestamp\b", "1700000000"),
+    (r"\bmonth year\b", "12 2026"),
+    (r"\byear\b", "2024"),
+    (r"today \+N days", "today +30 days"),
+    (r"\bN days\b", "30 days"),
+    (r"\+N days", "+30 days"),
+    (r"\bN\b", "30"),
+    (r'"fmt"', '"%Y-%m-%d"'),
+    (r'"str"', '"2024-03-15"'),
+    (r"\bdate\b(?=\s*\|\s*Use)", ""),
+    (r"\(same epoch subtraction\)", ""),
+    (r"\(use python or BSD-specific flags\)", ""),
+    (r"\bUse python\b", ""),
+]
+
+results = []
+for snip in sorted(snippets):
+    cmd = snip
+    for pat, rep in SUBS:
+        cmd = re.sub(pat, rep, cmd)
+    cmd = cmd.strip().rstrip("|").strip()
+    if not cmd or cmd.endswith("("):
+        continue
+    if re.match(r"^(date|cal|ncal)( -[A-Za-z])?$", cmd) or cmd in {"date", "ncal", "cal"}:
+        results.append({"command": cmd, "status": "skipped", "rc": 0, "stderr": "", "stdout": "prose, not a full command"})
+        continue
+    line = snippets.get(snip, "").lower()
+    if any(mk in line for mk in NEGATIVE_MARKERS):
+        results.append({"command": cmd, "status": "skipped", "rc": 0, "stderr": "", "stdout": "negative example in the text"})
+        continue
+    if any(mk in cmd for mk in TEMPLATE_MARKERS):
+        results.append({"command": cmd, "status": "skipped", "rc": 0, "stderr": "", "stdout": "template, not runnable"})
+        continue
+    if not _is_safe(cmd):
+        results.append({"command": cmd, "status": "skipped", "rc": 0, "stderr": "", "stdout": "not allowlisted / has shell metacharacters"})
+        continue
+    if any(mk in cmd for mk in BSD_MARKERS):
+        results.append({"command": cmd, "status": "skipped", "rc": 0, "stderr": "", "stdout": "BSD form (not runnable on GNU)"})
+        continue
+    try:
+        p = subprocess.run(
+            ["bash", "-c", cmd], capture_output=True, text=True, timeout=10, cwd="/tmp"
+        )
+        rc, err, out = p.returncode, p.stderr.strip(), p.stdout.strip()
+    except subprocess.TimeoutExpired:
+        rc, err, out = 124, "timeout after 10s", ""
+    # A leap-year probe is SUPPOSED to fail for a non-leap year: the error is
+    # the answer, not a broken command.
+    expected_error = "02-29" in cmd and rc != 0
+    status = "ok" if rc == 0 else ("expected-error" if expected_error else "FAIL")
+    results.append({"command": cmd, "status": status, "rc": rc, "stderr": err[:200], "stdout": out[:160]})
+
+fails = [r for r in results if r["status"] == "FAIL"]
+if as_json:
+    print(json.dumps({"file": path, "total": len(results), "failed": len(fails), "results": results}, indent=2))
+else:
+    print(f"smoke: {path} — {len(results)} command(s), {len(fails)} failure(s)")
+    for r in results:
+        mark = {"ok": "ok  ", "expected-error": "exp ", "skipped": "skip", "FAIL": "FAIL"}[r["status"]]
+        extra = f"  <- {r['stderr']}" if r["status"] == "FAIL" else (f"  -> {r['stdout'][:60]}" if r["stdout"] else "")
+        print(f"  {mark} {r['command']}{extra}")
+    if fails:
+        print("\nFAILED: the candidate tells the agent to run commands that do not work.")
+        for r in fails:
+            print(f"  - {r['command']}\n      {r['stderr']}")
+sys.exit(1 if fails else 0)
+PY

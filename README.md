@@ -34,6 +34,7 @@ are reviewed and released together.
 | `evolution/monitor/` | Telemetry reader + triage ranking (upstream Hermes leaves this a placeholder) |
 | `bin/evolve` | CLI wrapper — the optimizer |
 | `bin/triage` | CLI wrapper — "which skill should I evolve first?" (read-only, no cost) |
+| `bin/smoke-candidate` | Command smoke gate — extracts the skill's shell commands, runs the allowlisted ones, fails the candidate if any of them break |
 | `bin/skill-update-check.py` | Self-update check (git-SHA diff vs origin; no GitHub API) |
 | `datasets/skills/<name>/` | Golden JSONL eval sets (curated; highest signal) |
 | `tests/` | Offline pytest suite — the skill's selftest |
@@ -75,6 +76,30 @@ Models via env: `PI_EVOLUTION_OPTIMIZER` (default `openai/gpt-4.1`),
 
 Tier 1 (this repo): SKILL.md bodies. Tier 2/3/4 (tool descriptions, prompt
 sections, code) are future phases, mirroring the upstream Hermes roadmap.
+
+## The command smoke gate
+
+Lint checks a candidate's *structure*; it cannot check that the commands the
+skill tells the agent to run actually work. A candidate can pass every
+constraint, beat the baseline score, and still ship a broken command — the
+first positive Layer-2 run did exactly that (`date -d "2024-03-15" +%V / %G`
+fails with `extra operand '/'`, because the format must be quoted).
+
+`bin/smoke-candidate <candidate.md>` extracts the command-looking snippets
+from a skill body, substitutes the placeholders, runs the allowlisted ones
+(`date`, `cal`, `ncal`, `echo`), and fails on any non-zero exit — except the
+deliberate leap-year probe, whose error *is* the answer. Anything with shell
+metacharacters or a non-allowlisted binary is skipped, never executed, so an
+LLM-authored body cannot smuggle in another program.
+
+Run it manually, or let the pipeline do it:
+
+```bash
+bin/evolve --skill ncal --eval-source golden --dataset-path <golden.jsonl> --smoke
+```
+
+With `--smoke`, a candidate whose commands fail is rejected before deploy and
+saved as `evolved_FAILED_smoke.md`.
 
 ## The monitor / triage step
 
