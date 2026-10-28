@@ -56,6 +56,7 @@ shared data targets absolute paths outside skill directories).
 | `skill_managed` | a `skill_manage` op targeted the skill (create/patch/write_file/remove_file/delete) | 0.8 (authored = engaged) |
 | `skill_failed` | a `skill_manage` call failed; the skill name is parsed from the error | 1.5 (trouble signal) |
 | `learning_tool` | `wiki_retro` / `wiki_observe` ran | 0.05 (global, not per skill) |
+| `suggestion` | the extension computed the ranked target it injected into the prompt (`op` = the action) | 0 (marker only — it records that a suggestion was made, and which target) |
 
 ## What is NOT recorded
 

@@ -1,7 +1,7 @@
 ---
 name: skill-evolution
-description: 'Two-layer skill self-improvement for Pi: Layer 1 runtime (the skill_manage extension that writes and patches skills in-session, records per-skill usage telemetry, and writes a triage digest at session end) and Layer 2 offline optimizer (DSPy+GEPA over SKILL.md bodies) with a monitor/triage step that ranks which skill to evolve first. Mine session history or golden JSONL into eval data, evolve the skill body under constraint gates (15KB cap, ≤1.2x growth, frontmatter contract, lint gate), and deploy as a local evolve/ branch for human review — never pushes. Use when asked to "optimize/evolve a skill", "improve a SKILL.md offline", "run layer-2", "which skill should I evolve", "triage digest", "pi-skill-evolution", "skill evolution", or about the skill_manage runtime layer. Always dry-run first; ask-user gate before any model spend; report +0.000 outcomes as honest no-ops.'
-version: 1.3.0
+description: 'Two-layer skill self-improvement for Pi: Layer 1 runtime (the skill_manage extension that writes and patches skills in-session, records per-skill usage telemetry, writes a triage digest at session end, and suggests the ranked next target in the prompt) and Layer 2 offline optimizer (DSPy+GEPA over SKILL.md bodies) with a monitor/triage step that ranks which skill to evolve first. Mine session history or golden JSONL into eval data, evolve the skill body under constraint gates (15KB cap, ≤1.2x growth, frontmatter contract, lint gate), and deploy as a local evolve/ branch for human review — never pushes. Use when asked to "optimize/evolve a skill", "improve a SKILL.md offline", "run layer-2", "which skill should I evolve", "triage digest", "pi-skill-evolution", "skill evolution", or about the skill_manage runtime layer. Always dry-run first; ask-user gate before any model spend; report +0.000 outcomes as honest no-ops.'
+version: 1.4.0
 updated: "2026-10-28"
 triggers:
   - "evolve a skill"
@@ -70,7 +70,8 @@ The extension is the **write side** of Pi's natively read-only skill system.
 | Prompt injection | `before_agent_start` adds the `skill_memory` section (skills-first routing: task knowledge → skill, cross-session facts → wiki) |
 | Nudge | `agent_before_settle` delivers ONE learning nudge per session (≥ `PI_SKILL_MANAGE_NUDGE_MIN_TOOLS` tool calls, no learning tool used) |
 | Telemetry | Appends per-skill usage events (`skill_loaded` via `skill_search`, `skill_read` via `read` of a `SKILL.md`, `skill_managed` / `skill_failed` via `skill_manage`, `learning_tool`) to a JSONL outside the skill tree — the feed the monitor/triage step consumes. Schema: `layer1/telemetry-schema.md` |
-| Session-end digest | On `session_shutdown` the extension runs the monitor (`evolution.monitor.triage --json`, stdlib-only, no venv needed) and appends a dated digest section — ranking, top action, and the delta vs the previous digest. Skipped on `/reload`. See "Session-end digest" below |
+| Session-end digest | On `session_shutdown` the extension runs the monitor (`evolution.monitor.triage --json`, stdlib-only) and appends a dated digest: ranking, top action, delta vs the previous digest. Skipped on `/reload` |
+| Suggestion | One ranked target per session (`triage --suggest`) injected into the `skill_memory` prompt section. Pointer only — no spend, no automatic run |
 | Env knobs | `PI_SKILL_MANAGE_ROOTS`, `PI_SKILL_MANAGE_MAX_SKILL_BYTES` (15360), `PI_SKILL_MANAGE_NUDGE_MIN_TOOLS` (6), `PI_SKILL_MANAGE_DISABLE_NUDGE`; telemetry + digest knobs in `references/monitor-and-digest.md` §4 |
 
 **Deployment** — the live file is a symlink into this repo, never a copy
@@ -84,36 +85,16 @@ copy to drift.
 ## Session-end digest
 
 On `session_shutdown` the extension runs the monitor and appends a digest, so
-every session leaves a record of what is worth evolving next.
-
-```
-~/.local/share/skill-evolution/digests/2026-10-28.md   # one file per UTC day
-~/.local/share/skill-evolution/digests/latest.md        # the newest section
-```
-
-Each section carries the session's own event counts, the top action, the
-delta vs the previous digest, and the ranked table. The monitor is stdlib-only,
-so this costs **zero** model calls. Skipped on `/reload`; one section per
-session even though `session_shutdown` can fire twice; files older than 30
-days are pruned. Disable with `PI_SKILL_TRIAGE_ON_SHUTDOWN=0`.
-
-Format contract and the full knob table: `references/monitor-and-digest.md`
-(§3) and `layer1/digest-schema.md`.
+every session leaves a record of what is worth evolving next
+(`~/.local/share/skill-evolution/digests/YYYY-MM-DD.md` + `latest.md`).
+Zero model calls, skipped on `/reload`, one section per session, files older
+than 30 days pruned. Format: `layer1/digest-schema.md`.
 
 ## Monitor + triage — pick the target before spending tokens
 
-`bin/triage` answers "which skill is worth evolving?" from signals Pi already
-has. It never runs the optimizer and never merges anything.
-
-```bash
-bin/triage                      # markdown table, ranked
-bin/triage --json               # machine-readable
-bin/triage --only-action measure
-```
-
-**priority = usage × potential** — `usage` is the recency-decayed telemetry
-score (14-day half-life: loaded 1.0, managed 0.8, read 0.6, failed 1.5);
-`potential` is the estimated payoff of optimizing that skill:
+`bin/triage` ranks skills by `usage × potential` from the telemetry feed:
+`usage` = recency-decayed telemetry score (14-day half-life: loaded 1.0,
+managed 0.8, read 0.6, failed 1.5); `potential` = estimated payoff.
 
 | Condition | Potential | Action |
 | --- | --- | --- |
@@ -123,14 +104,29 @@ score (14-day half-life: loaded 1.0, managed 0.8, read 0.6, failed 1.5);
 | used, golden dataset | 0.60 | `evolve` — GEPA candidate (human merge required) |
 | installed, never used | 0.35 | `review` — fix the trigger description or prune it |
 
-`measure` deliberately outranks `evolve`: a skill that is used but has no eval
-set cannot be evolved responsibly yet — the golden JSONL comes first. This is
-the port of Hermes' Phase-5 auto-triage ("rank by potential improvement ×
-usage frequency"), which upstream still leaves as a placeholder
-(`evolution/monitor/__init__.py` = *"Phase placeholder: monitor evolution."*).
+`measure` deliberately outranks `evolve`: a used-but-unmeasured skill cannot
+be evolved responsibly yet. This is the port of Hermes' Phase-5 auto-triage
+("rank by potential improvement × usage frequency"), which upstream still
+leaves a placeholder.
 
-Triage reads the telemetry file only — no model calls, no cost. Run it before
-`bin/evolve` to choose the target, and again after a run to see the delta.
+## Extension suggests, agent acts
+
+The extension computes one suggestion per session
+(`evolution.monitor.triage --suggest` → the highest-priority actionable
+target) and injects it into the `skill_memory` prompt section:
+
+```
+Skill self-improvement: the triage digest ranks `ncal` as the next target
+(action: measure, priority 0.90). used but has no golden eval set — …
+Act on it only when the user asks to improve a skill; run `bin/evolve
+--dry-run` first and keep the ask-user cost gate before any model spend.
+```
+
+The suggestion is a pointer, not an action: nothing is spent, and the skill's
+own dry-run + ask-user gate still governs any real run. `review` targets are
+never suggested (that is a human's call). Knobs: `PI_SKILL_SUGGEST=0`
+disables it; `PI_SKILL_SUGGEST_MAX_AGE_DAYS` (7) expires a stale suggestion;
+`PI_SKILL_SUGGEST_REFRESH_MIN` (30) paces recomputation.
 Full reference: `references/monitor-and-digest.md`.
 
 
@@ -205,6 +201,7 @@ bin/evolve --skill <name> --eval-source golden \
 | `PI_EVOLUTION_MAX_SKILL` | 15360 | SKILL.md byte cap |
 | `PI_EVOLUTION_MAX_GROWTH` | 1.2 | Accepted byte growth vs baseline |
 | `PI_SKILL_TELEMETRY*` / `PI_SKILL_TRIAGE*` | see `references/monitor-and-digest.md` §4 | telemetry writer + session-end digest controls |
+| `PI_SKILL_SUGGEST*` | see `references/monitor-and-digest.md` §5 | prompt suggestion controls (enable, max age, refresh) |
 
 ## Hard guarantees
 

@@ -230,6 +230,31 @@ def triage(
     return rows
 
 
+#: Actions that mean "there is work to do here" — a skill with any of these is
+#: worth suggesting to the agent. `review` is deliberately excluded: it means
+#: "fix the trigger or prune it", which is a human's call, not a skill run.
+ACTIONABLE_ACTIONS: frozenset[str] = frozenset({"measure", "evolve", "shrink", "stabilize", "debug"})
+
+
+def suggest(rows: list[TriageRow]) -> dict | None:
+    """Pick the single highest-priority actionable target, or None.
+
+    This is what the Layer-1 extension injects into the prompt so the agent
+    knows which skill to work on next. It is a *suggestion*: the agent still
+    needs the user's request and the ask-user cost gate before any spend.
+    """
+    for r in rows:
+        if r.action in ACTIONABLE_ACTIONS and r.usage > 0:
+            return {
+                "skill": r.skill,
+                "action": r.action,
+                "priority": round(r.priority, 3),
+                "usage": round(r.usage, 3),
+                "reason": r.reason,
+            }
+    return None
+
+
 def render_markdown(rows: list[TriageRow], limit: int = 20, learning_calls: int = 0) -> str:
     """Human/agent-readable triage table."""
     if not rows:
@@ -268,6 +293,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--limit", type=int, default=20, help="rows to print")
     ap.add_argument("--json", action="store_true", help="emit JSON instead of a table")
     ap.add_argument("--only-action", default=None, help="filter rows by action (measure/evolve/shrink/...)")
+    ap.add_argument(
+        "--suggest",
+        action="store_true",
+        help="print ONE actionable target as JSON (the extension's prompt suggestion), or null",
+    )
     args = ap.parse_args(argv)
 
     usage = load_usage(args.telemetry, half_life_days=args.half_life)
@@ -276,6 +306,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.only_action:
         rows = [r for r in rows if r.action == args.only_action]
 
+    if args.suggest:
+        print(json.dumps(suggest(rows)))
+        return 0
     if args.json:
         print(json.dumps([r.to_dict() for r in rows], indent=2))
     else:

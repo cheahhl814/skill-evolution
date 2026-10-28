@@ -106,3 +106,41 @@ Format contract: `layer1/digest-schema.md`.
 | `PI_SKILL_TRIAGE_TIMEOUT_MS` | 15000 | subprocess timeout |
 | `PI_SKILL_TRIAGE_TOP` | 10 | rows in the digest table |
 | `PI_SKILL_TRIAGE_DIGEST_KEEP_DAYS` | 30 | prune older digest files |
+| `PI_SKILL_SUGGEST` | 1 | `0` disables the prompt suggestion |
+| `PI_SKILL_SUGGEST_MAX_AGE_DAYS` | 7 | a suggestion older than this is not injected |
+| `PI_SKILL_SUGGEST_REFRESH_MIN` | 30 | minutes between suggestion recomputations |
+
+## 5. The prompt suggestion (the extension suggests, the agent acts)
+
+Once per session (`session_start`) the extension asks the monitor for the
+single highest-priority **actionable** target:
+
+```bash
+python -m evolution.monitor.triage --suggest
+# {"skill": "ncal", "action": "measure", "priority": 0.899, "usage": 0.999,
+#  "reason": "used but has no golden eval set — build …/golden.jsonl before evolving"}
+```
+
+and injects it into the `skill_memory` prompt section:
+
+```
+Skill self-improvement: the triage digest ranks `ncal` as the next target
+(action: measure, priority 0.90). used but has no golden eval set — …
+Act on it only when the user asks to improve a skill; run `bin/evolve
+--dry-run` first and keep the ask-user cost gate before any model spend.
+Never push: the candidate is a local branch for human review.
+```
+
+| Rule | Why |
+| --- | --- |
+| Only `measure` / `evolve` / `shrink` / `stabilize` / `debug` are suggested | `review` ("fix the trigger or prune it") is a human's call, not a skill run |
+| A target with `usage == 0` is never suggested | optimising a skill nobody uses is waste |
+| The suggestion is a pointer, never an action | it spends nothing and starts no optimizer run; the skill's dry-run → ask-user-cost-gate → human-merge procedure still governs |
+| Computed at `session_start`, refreshed at most every `PI_SKILL_SUGGEST_REFRESH_MIN` minutes | a subprocess per turn would be wasteful; one per session is ~0.3 s and free |
+| Expires after `PI_SKILL_SUGGEST_MAX_AGE_DAYS` | a week-old target is probably not the next one |
+| Stdlib-only subprocess (`python -m evolution.monitor.triage --suggest`, `PYTHONPATH=<repo>`) | no venv, no model calls, no cost |
+
+The suggestion is also recorded in the telemetry feed as
+`{"event": "suggestion", "skill": …, "op": <action>, "source": "triage"}`, so
+"did the agent act on the suggestion?" is answerable from the same JSONL.
+

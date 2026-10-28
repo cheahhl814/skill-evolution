@@ -26,6 +26,9 @@
  *   PI_SKILL_TRIAGE_TIMEOUT_MS          default 15000
  *   PI_SKILL_TRIAGE_TOP                 default 10 (rows in the digest table)
  *   PI_SKILL_TRIAGE_DIGEST_KEEP_DAYS    default 30 (older digest files are pruned)
+ *   PI_SKILL_SUGGEST                     =0 to stop injecting the ranked target into the prompt
+ *   PI_SKILL_SUGGEST_MAX_AGE_DAYS        default 7 (a suggestion older than this is not injected)
+ *   PI_SKILL_SUGGEST_REFRESH_MIN         default 30 (min minutes between suggestion refreshes)
  */
 
 import * as fs from "node:fs";
@@ -329,6 +332,85 @@ function writeDigest(rows: TriageRow[], counts: { skills: number; loaded: number
 }
 
 
+// ── suggestion: the ranked target, injected into the prompt ────────────────
+//
+// The extension suggests; the agent acts. The suggestion is computed ONCE per
+// session (a stdlib-only subprocess, no model cost) and injected into the
+// `skill_memory` prompt section, so the agent knows which skill the triage
+// digest ranks next. It never spends anything by itself: the skill's own
+// dry-run + ask-user cost gate still governs any real run.
+
+const SUGGEST_ENABLED = process.env.PI_SKILL_SUGGEST !== "0";
+const SUGGEST_MAX_AGE_MS = Number(process.env.PI_SKILL_SUGGEST_MAX_AGE_DAYS ?? "7") * 86400000;
+const SUGGEST_REFRESH_MS = Number(process.env.PI_SKILL_SUGGEST_REFRESH_MIN ?? "30") * 60000;
+
+type Suggestion = {
+	skill: string;
+	action: string;
+	priority: number;
+	usage: number;
+	reason: string;
+};
+
+/** Run the monitor's suggestion mode. Returns null on any failure. */
+function runSuggest(root: string): Suggestion | null {
+	const venvPython = path.join(root, ".venv", "bin", "python");
+	const python = fs.existsSync(venvPython) ? venvPython : "python3";
+	try {
+		const res = spawnSync(python, ["-m", "evolution.monitor.triage", "--suggest"], {
+			cwd: root,
+			env: { ...process.env, PYTHONPATH: root },
+			encoding: "utf8",
+			timeout: TRIAGE_TIMEOUT_MS,
+			maxBuffer: 1024 * 1024,
+		});
+		if (res.status !== 0 || !res.stdout) return null;
+		const parsed = JSON.parse(res.stdout.trim());
+		if (!parsed || typeof parsed.skill !== "string") return null;
+		return parsed as Suggestion;
+	} catch {
+		return null;
+	}
+}
+
+let SUGGESTION: Suggestion | null = null;
+let SUGGESTION_TS = 0;
+
+/** Refresh the cached suggestion (at most once per refresh window). */
+function refreshSuggestion(): void {
+	if (!SUGGEST_ENABLED) return;
+	const now = Date.now();
+	if (SUGGESTION_TS && now - SUGGESTION_TS < SUGGEST_REFRESH_MS) return;
+	const root = resolveEvolutionRoot();
+	if (!root) return;
+	const s = runSuggest(root);
+	SUGGESTION = s;
+	SUGGESTION_TS = now;
+	if (s) record({ event: "suggestion", skill: s.skill, op: s.action, source: "triage" });
+}
+
+/** The prompt lines for the current suggestion (empty when there is none). */
+function suggestionLines(): string[] {
+	if (!SUGGEST_ENABLED || !SUGGESTION) return [];
+	if (Date.now() - SUGGESTION_TS > SUGGEST_MAX_AGE_MS) return [];
+	const s = SUGGESTION;
+	return [
+		"",
+		"Skill self-improvement: the triage digest ranks `" +
+			s.skill +
+			"` as the next target (action: " +
+			s.action +
+			", priority " +
+			s.priority.toFixed(2) +
+			"). " +
+			s.reason +
+			".",
+		"Act on it only when the user asks to improve a skill; run `bin/evolve --dry-run` first and keep the",
+		"ask-user cost gate before any model spend. Never push: the candidate is a local branch for human review.",
+	];
+}
+
+// ── path safety (mirrors pi's own "escapes the skills dir" contract) ───────
 function resolveInsideRoot(name: string, root: string): string | null {
 	if (!fs.existsSync(root)) return null;
 	if (!NAME_RE.test(name)) return null;
@@ -478,6 +560,7 @@ export default function skillMemoryExtension(pi: ExtensionAPI) {
 		learningToolUsed = false;
 		nudgeDelivered = false;
 		record({ event: "session_start", reason: String((event as { reason?: string })?.reason ?? "") });
+		refreshSuggestion();
 	});
 
 	pi.on("tool_call", (event) => {
@@ -510,6 +593,8 @@ export default function skillMemoryExtension(pi: ExtensionAPI) {
 			"(wiki_retro when llm-wiki is available). Write entries as declarative facts, not imperatives.",
 			"After difficult or iterative tasks, offer to save the approach as a skill.",
 		].join("\n");
+		const extra = suggestionLines();
+		if (extra.length) sections.skill_memory += "\n" + extra.join("\n");
 	});
 
 	// ── one-time session-end learning nudge (loop-guarded) ────────────────

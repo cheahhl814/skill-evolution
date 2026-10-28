@@ -13,7 +13,7 @@ tree), the Python package, the git repo, and the home of the Pi extension
 
 | Layer | What | Where | When |
 | --- | --- | --- | --- |
-| **Layer 1** | `skill_manage` tool: create / patch / write_file / remove_file / delete skills atomically, with guardrails (name regex, escape guard, frontmatter contract, 15KB cap, unique-patch match, snapshot+rollback, symlink-aware delete). Injects the skills-first routing prompt; one learning nudge per session; **records per-skill usage telemetry**; **writes a triage digest at session end**. | `layer1/extension/skill-memory.ts` | in-session, live |
+| **Layer 1** | `skill_manage` tool: create / patch / write_file / remove_file / delete skills atomically, with guardrails (name regex, escape guard, frontmatter contract, 15KB cap, unique-patch match, snapshot+rollback, symlink-aware delete). Injects the skills-first routing prompt; one learning nudge per session; **records per-skill usage telemetry**; **writes a triage digest at session end**; **suggests the ranked next target in the prompt**. | `layer1/extension/skill-memory.ts` | in-session, live |
 | **Monitor** | Reads the telemetry, ranks skills by `usage × potential`, prints the next action per skill (`measure` / `evolve` / `shrink` / `stabilize` / `review`). No model calls. | `evolution/monitor/`, `bin/triage` | offline, on demand |
 | **Layer 2** | DSPy + GEPA optimizer over a skill's `SKILL.md` body: eval data from sessions / golden JSONL / synthetic, constraint gates, structural lint gate, human-reviewed local-branch deployment. | `evolution/`, `bin/evolve`, `datasets/`, `tests/` | offline, on demand |
 
@@ -29,6 +29,7 @@ are reviewed and released together.
 | `layer1/agents-routing-section.md` | Copy of the agent's global instruction file's routing section (§7) — keep in sync |
 | `layer1/telemetry-schema.md` | The telemetry wire contract (JSONL) shared by the TS writer and the Python reader |
 | `layer1/digest-schema.md` | The session-end digest format (what is written, where, and when it is skipped) |
+| `references/monitor-and-digest.md` | Full reference: telemetry weights, triage table, digest format, prompt suggestion, all knobs |
 | `evolution/` | The Python package (config, constraints, dataset builders, fitness, CLI) |
 | `evolution/monitor/` | Telemetry reader + triage ranking (upstream Hermes leaves this a placeholder) |
 | `bin/evolve` | CLI wrapper — the optimizer |
@@ -112,6 +113,28 @@ stdlib-only, so this costs **zero** model calls. `/reload` is skipped (it
 must not spam the directory), one section is written per session even though
 `session_shutdown` can fire twice, and files older than 30 days are pruned.
 Turn it off with `PI_SKILL_TRIAGE_ON_SHUTDOWN=0`.
+
+## The extension suggests, the agent acts
+
+The same ranking reaches the agent as a **prompt suggestion**: once per
+session the extension asks the monitor for the single highest-priority
+actionable target (`evolution.monitor.triage --suggest`) and injects it into
+the `skill_memory` prompt section.
+
+```
+Skill self-improvement: the triage digest ranks `ncal` as the next target
+(action: measure, priority 0.90). used but has no golden eval set — …
+Act on it only when the user asks to improve a skill; run `bin/evolve
+--dry-run` first and keep the ask-user cost gate before any model spend.
+```
+
+It is a pointer, not an action: the suggestion spends nothing, triggers no
+optimizer run, and `review` targets (fix the trigger / prune) are never
+suggested because that is a human's call. The skill's own dry-run →
+ask-user-cost-gate → human-merge procedure still governs any real run.
+Knobs: `PI_SKILL_SUGGEST=0` disables it, `PI_SKILL_SUGGEST_MAX_AGE_DAYS`
+(7) expires a stale suggestion, `PI_SKILL_SUGGEST_REFRESH_MIN` (30) paces
+recomputation.
 
 ## How it differs from the Hermes upstream
 

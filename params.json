@@ -1,8 +1,8 @@
 {
   "skill_name": "skill-evolution",
   "skill_title": "Skill Self-Improvement — Layer 1 runtime + monitor/triage + Layer 2 offline optimizer for Pi skills",
-  "skill_description": "Two-layer self-improvement for Pi skills: Layer 1 runtime skill_manage extension with per-skill usage telemetry and a session-end triage digest, a monitor/triage step that ranks which skill to evolve first, and Layer 2 offline DSPy+GEPA optimization of SKILL.md bodies, constraint-gated, human-reviewed.",
-  "skill_version": "1.3.0",
+  "skill_description": "Two-layer self-improvement for Pi skills: Layer 1 runtime skill_manage extension with per-skill usage telemetry, a session-end triage digest and a prompt suggestion naming the next target, a monitor/triage step that ranks which skill to evolve first, and Layer 2 offline DSPy+GEPA optimization of SKILL.md bodies, constraint-gated, human-reviewed.",
+  "skill_version": "1.4.0",
   "skill_updated": "2026-10-28",
   "skill_triggers": ["evolve a skill", "optimize skill", "layer-2 evolution", "skill evolution", "GEPA", "skill_manage", "which skill should I evolve", "skill usage telemetry", "triage digest"],
   "run_dir": "/home/cheahhl814/claude_workspace/bioinformatics/AIx-BIO/skills/skill-evolution",
@@ -34,6 +34,13 @@
         "output": "~/.local/share/skill-evolution/digests/ (YYYY-MM-DD.md + latest.md + state.json)",
         "schema": "layer1/digest-schema.md",
         "cost": "zero model calls; read-only (never evolves, never merges)"
+      },
+      "suggestion": {
+        "computed": "once per session (session_start), refreshed at most every PI_SKILL_SUGGEST_REFRESH_MIN minutes",
+        "command": "python -m evolution.monitor.triage --suggest",
+        "injected_into": "the skill_memory prompt section at before_agent_start",
+        "policy": "pointer only — the agent acts only on a user request, behind the dry-run + ask-user cost gate",
+        "knobs": ["PI_SKILL_SUGGEST", "PI_SKILL_SUGGEST_MAX_AGE_DAYS", "PI_SKILL_SUGGEST_REFRESH_MIN"]
       }
     },
     "monitor": {

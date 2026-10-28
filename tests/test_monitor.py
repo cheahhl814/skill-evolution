@@ -11,7 +11,7 @@ import json
 import time
 
 from evolution.monitor.telemetry import aggregate, read_events
-from evolution.monitor.triage import SkillFacts, TriageRow, triage
+from evolution.monitor.triage import SkillFacts, TriageRow, suggest, triage
 
 NOW = 1_760_000_000.0  # fixed clock for deterministic decay
 
@@ -138,3 +138,38 @@ def test_triage_row_serialises():
     assert d["action"] == "measure"
     assert d["loads"] == 1
     assert json.dumps(d)  # JSON-safe
+
+
+# ── suggestion (what the extension injects into the prompt) ─────────────────
+
+
+def test_suggest_picks_top_actionable_target():
+    usage = aggregate(
+        [_ev("skill_loaded", "measured"), _ev("skill_loaded", "measured"), _ev("skill_loaded", "ncal")],
+        now=NOW,
+    )
+    facts = {"measured": _facts("measured", golden=True), "ncal": _facts("ncal")}
+    s = suggest(triage(usage=usage, facts=facts))
+    assert s is not None
+    assert s["skill"] == "measured"
+    assert s["action"] == "evolve"
+    assert s["priority"] > 0
+    assert "reason" in s
+
+
+def test_suggest_is_none_when_nothing_is_actionable():
+    # never used -> action "review" (a human's call, not a skill run)
+    usage = aggregate([], now=NOW)
+    facts = {"idle": _facts("idle")}
+    assert suggest(triage(usage=usage, facts=facts)) is None
+
+
+def test_suggest_requires_real_usage():
+    # used but with no golden set -> "measure" IS actionable
+    usage = aggregate([_ev("skill_loaded", "unmeasured")], now=NOW)
+    s = suggest(triage(usage=usage, facts={"unmeasured": _facts("unmeasured")}))
+    assert s is not None and s["action"] == "measure"
+    # but a row with usage 0 must never be suggested
+    rows = triage(usage=aggregate([], now=NOW), facts={"unmeasured": _facts("unmeasured")})
+    assert all(r.usage == 0 for r in rows)
+    assert suggest(rows) is None
