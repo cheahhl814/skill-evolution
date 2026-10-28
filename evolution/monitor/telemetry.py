@@ -33,6 +33,10 @@ EVENT_WEIGHTS: dict[str, float] = {
     "skill_managed": 0.8,
     "skill_failed": 1.5,
     "learning_tool": 0.05,
+    # A proposal is a *conclusion*, not a use: it must not inflate the usage
+    # score (it would make a barely-used skill look important), but it is the
+    # accumulated evidence behind a create/revise conclusion.
+    "skill_proposed": 0.0,
 }
 
 #: Days after which an event counts half as much.
@@ -49,12 +53,21 @@ class SkillUsage:
     edits: int = 0
     failures: int = 0
     learning_calls: int = 0
+    proposals: int = 0
     sessions: set[str] = field(default_factory=set)
     days: set[str] = field(default_factory=set)
     first_seen: float = 0.0
     last_seen: float = 0.0
     score: float = 0.0
     raw_score: float = 0.0
+    #: Sessions in which the skill was actually loaded or read (the "breadth"
+    #: signal — a skill used in one session is a one-off, not a pattern).
+    use_sessions: set[str] = field(default_factory=set)
+    #: Per-session count of loads+reads. A skill consulted several times in one
+    #: session is the clearest "the skill did not have the answer" signal.
+    session_uses: dict[str, int] = field(default_factory=dict)
+    #: Sessions in which a revision/create was proposed for this skill.
+    proposal_sessions: set[str] = field(default_factory=set)
 
     @property
     def used(self) -> bool:
@@ -66,6 +79,11 @@ class SkillUsage:
         """Number of write-side operations (authoring is a churn signal)."""
         return self.edits
 
+    @property
+    def revisits(self) -> int:
+        """Highest number of loads+reads inside any single session."""
+        return max(self.session_uses.values()) if self.session_uses else 0
+
     def to_dict(self) -> dict:
         return {
             "skill": self.skill,
@@ -74,7 +92,11 @@ class SkillUsage:
             "edits": self.edits,
             "failures": self.failures,
             "learning_calls": self.learning_calls,
+            "proposals": self.proposals,
             "sessions": len(self.sessions),
+            "use_sessions": len(self.use_sessions),
+            "revisits": self.revisits,
+            "proposal_sessions": len(self.proposal_sessions),
             "days": len(self.days),
             "first_seen": self.first_seen,
             "last_seen": self.last_seen,
@@ -162,6 +184,10 @@ def aggregate(
             rec.first_seen = ts
         if ts > rec.last_seen:
             rec.last_seen = ts
+        if kind in ("skill_loaded", "skill_read"):
+            if session:
+                rec.use_sessions.add(session)
+                rec.session_uses[session] = rec.session_uses.get(session, 0) + 1
         if kind == "skill_loaded":
             rec.loads += 1
         elif kind == "skill_read":
@@ -170,6 +196,10 @@ def aggregate(
             rec.edits += 1
         elif kind == "skill_failed":
             rec.failures += 1
+        elif kind == "skill_proposed":
+            rec.proposals += 1
+            if session:
+                rec.proposal_sessions.add(session)
         elif kind == "learning_tool":
             rec.learning_calls += 1
 

@@ -53,10 +53,34 @@ shared data targets absolute paths outside skill directories).
 | `session_start` | the extension loads (startup/reload/new/resume/fork) | session counting |
 | `skill_loaded` | `skill_search` with `action=load` — the agent pulled a skill into context | **1.0** (strongest "this skill is used") |
 | `skill_read` | the `read` tool opened a path whose basename is `SKILL.md` | 0.6 |
-| `skill_managed` | a `skill_manage` op targeted the skill (create/patch/write_file/remove_file/delete) | 0.8 (authored = engaged) |
+| `skill_managed` | a `skill_manage` op targeted the skill (create/patch/write_file/remove_file/delete), or a direct `edit`/`write` of a `SKILL.md` (`op: "direct_edit"`) | 0.8 (authored = engaged) |
 | `skill_failed` | a `skill_manage` call failed; the skill name is parsed from the error | 1.5 (trouble signal) |
+| `skill_proposed` | the agent ATTEMPTED a `create` or `patch` — the conclusion itself, approved or not | **0.0** (marker only — counted as evidence, never as usage) |
 | `learning_tool` | `wiki_retro` / `wiki_observe` ran | 0.05 (global, not per skill) |
 | `suggestion` | the extension computed the ranked target it injected into the prompt (`op` = the action) | 0 (marker only — it records that a suggestion was made, and which target) |
+
+### `skill_proposed` — the accumulated-experience channel
+
+`skill_proposed` is the evidence behind the write gate. The
+`evolution/monitor/evidence.py` bar reads it as follows:
+
+- **Revise** a skill: used across ≥ `PI_SKILL_EVIDENCE_MIN_SESSIONS` (2)
+  independent sessions **and** at least one deficiency signal — revisited ≥
+  `PI_SKILL_EVIDENCE_MIN_REVISITS` (3) times inside one session, ≥
+  `PI_SKILL_EVIDENCE_MIN_FAILURES` (1) failed write, or proposed for revision
+  in ≥ `PI_SKILL_EVIDENCE_MIN_PROPOSALS` (2) independent sessions.
+- **Create** a skill: the same name proposed in ≥
+  `PI_SKILL_EVIDENCE_MIN_PROPOSALS` (2) independent sessions. Two proposals
+  inside ONE session are not independent and do not count.
+
+The reader therefore tracks, per skill: `use_sessions` (sessions with a
+load/read), `session_uses` (per-session load+read counts, from which
+`revisits` is derived), `proposals` and `proposal_sessions`. All four appear
+in `SkillUsage.to_dict()`.
+
+Because a proposal is recorded on ATTEMPT, the bar accumulates even when the
+user declines — which is the point: a need that recurs across sessions is a
+conclusion, and a one-off is not.
 
 ## What is NOT recorded
 

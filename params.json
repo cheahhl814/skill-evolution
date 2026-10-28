@@ -1,8 +1,8 @@
 {
   "skill_name": "skill-evolution",
   "skill_title": "Skill Self-Improvement — Layer 1 runtime + monitor/triage + Layer 2 offline optimizer for Pi skills",
-  "skill_description": "Two-layer self-improvement for Pi skills: Layer 1 runtime skill_manage extension (patches ungated; a NEW skill needs user approval and must pass skill-forge's lint gate) with per-skill usage telemetry, a session-end triage digest and a prompt suggestion naming the next target, a monitor/triage step that ranks which skill to evolve first, and Layer 2 offline DSPy+GEPA optimization of SKILL.md bodies, constraint-gated, human-reviewed.",
-  "skill_version": "1.6.0",
+  "skill_description": "Two-layer self-improvement for Pi skills: Layer 1 runtime skill_manage extension (every skill write gated by an accumulated-experience bar and the user's approval; a new skill must also pass skill-forge's lint gate) with per-skill usage telemetry, a session-end triage digest and a prompt suggestion naming the next target, a monitor/triage step that ranks which skill to evolve first, and Layer 2 offline DSPy+GEPA optimization of SKILL.md bodies, constraint-gated, human-reviewed.",
+  "skill_version": "1.7.0",
   "skill_updated": "2026-10-28",
   "skill_triggers": ["evolve a skill", "optimize skill", "layer-2 evolution", "skill evolution", "GEPA", "skill_manage", "which skill should I evolve", "skill usage telemetry", "triage digest"],
   "run_dir": "/home/cheahhl814/claude_workspace/bioinformatics/AIx-BIO/skills/skill-evolution",
@@ -30,12 +30,22 @@
       "telemetry_path": "~/.local/share/skill-evolution/skill-usage.jsonl",
       "write_policy": {
         "reference": "references/layer1-write-policy.md",
-        "gated_ops": ["create"],
-        "ungated_ops": ["patch", "write_file", "remove_file", "delete"],
-        "approval": "ctx.ui.confirm — the user approves every new skill; no UI = fail closed; PI_SKILL_MANAGE_ALLOW_CREATE=1 is the unattended opt-out",
-        "conformance": "staged in a temp dir, then linted by skill-forge/bin/skill-lint.py --profile tool-skill --include-vendored --skill-dirs <roots>; any FAIL rejects the batch",
-        "skill_forge_contract": "frontmatter name/description/version/triggers, a README.md in the same batch (write_file op), and `skills: [skill-forge]`",
-        "tests": "tests/test_extension_gate.mjs (13 tests)"
+        "gated_ops": ["create", "patch", "write_file", "remove_file", "delete"],
+        "direct_edit_gated": true,
+        "gates": [
+          "accumulated-experience bar (evolution/monitor/evidence.py) — revise needs breadth (>=2 sessions) AND a deficiency signal (revisits/failures/proposals); create needs the same need proposed in >=2 independent sessions",
+          "user approval (ctx.ui.confirm; no UI = fail closed)",
+          "skill-forge lint gate (new skills only, staged in a temp dir)"
+        ],
+        "knobs": [
+          "PI_SKILL_MANAGE_ALLOW_CREATE",
+          "PI_SKILL_MANAGE_ALLOW_REVISION",
+          "PI_SKILL_EVIDENCE_MIN_SESSIONS",
+          "PI_SKILL_EVIDENCE_MIN_REVISITS",
+          "PI_SKILL_EVIDENCE_MIN_FAILURES",
+          "PI_SKILL_EVIDENCE_MIN_PROPOSALS"
+        ],
+        "tests": "tests/test_extension_gate.mjs (23 tests) + tests/test_evidence.py"
       },
       "session_end_digest": {
         "trigger": "session_shutdown (skipped on reload)",
@@ -62,8 +72,17 @@
       "role": "offline evolution — DSPy+GEPA optimizer over SKILL.md bodies",
       "source": "evolution/",
       "entrypoint": "bin/evolve",
+      "procedure_reference": "references/layer2-procedure.md",
       "structural_gate": "skill-forge bin/skill-lint.py (auto-detected)",
       "command_gate": "bin/smoke-candidate (opt-in via --smoke): runs the candidate's allowlisted shell commands and rejects one whose commands break"
+    },
+    "evidence": {
+      "role": "the accumulated-experience bar — what makes a skill write a conclusion rather than a reflex",
+      "source": "evolution/monitor/evidence.py",
+      "telemetry_channel": "skill_proposed (weight 0 — evidence, never usage)",
+      "revise_bar": "breadth (use_sessions >= 2) AND a deficiency signal (revisits >= 3 in one session, failures >= 1, or proposal_sessions >= 2)",
+      "create_bar": "the same need proposed in >= 2 independent sessions",
+      "cli": "python -m evolution.monitor.evidence --skill <name> --kind revise|create --json | --eligible"
     }
   },
   "generated": "2026-10-23T14:4x:00+08:00"

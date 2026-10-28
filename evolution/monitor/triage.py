@@ -242,16 +242,29 @@ def suggest(rows: list[TriageRow]) -> dict | None:
     This is what the Layer-1 extension injects into the prompt so the agent
     knows which skill to work on next. It is a *suggestion*: the agent still
     needs the user's request and the ask-user cost gate before any spend.
+
+    A row must also clear the accumulated-experience bar (see
+    `evolution/monitor/evidence.py`) to be suggested at all: a skill used in
+    one session is not a conclusion, and a well-used skill needs no work. The
+    bar is what keeps the runtime from nudging unrelated sessions into
+    "improving" a skill that nobody found deficient.
     """
+    from .evidence import KIND_REVISE, evaluate
+
     for r in rows:
-        if r.action in ACTIONABLE_ACTIONS and r.usage > 0:
-            return {
-                "skill": r.skill,
-                "action": r.action,
-                "priority": round(r.priority, 3),
-                "usage": round(r.usage, 3),
-                "reason": r.reason,
-            }
+        if r.action not in ACTIONABLE_ACTIONS or r.usage <= 0:
+            continue
+        ev = evaluate(r.skill, r.usage_detail, kind=KIND_REVISE)
+        if not ev.eligible:
+            continue
+        return {
+            "skill": r.skill,
+            "action": r.action,
+            "priority": round(r.priority, 3),
+            "usage": round(r.usage, 3),
+            "reason": r.reason,
+            "evidence": ev.reason,
+        }
     return None
 
 

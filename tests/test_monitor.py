@@ -144,8 +144,16 @@ def test_triage_row_serialises():
 
 
 def test_suggest_picks_top_actionable_target():
+    # The suggestion is evidence-gated (evolution/monitor/evidence.py): a skill
+    # is only named when the accumulated-experience bar is cleared — used across
+    # several sessions AND showing a deficiency signal.
     usage = aggregate(
-        [_ev("skill_loaded", "measured"), _ev("skill_loaded", "measured"), _ev("skill_loaded", "ncal")],
+        [
+            _ev("skill_loaded", "measured", session="s1"),
+            _ev("skill_loaded", "measured", session="s2"),
+            _ev("skill_failed", "measured", session="s2"),
+            _ev("skill_loaded", "ncal", session="s1"),
+        ],
         now=NOW,
     )
     facts = {"measured": _facts("measured", golden=True), "ncal": _facts("ncal")}
@@ -155,6 +163,7 @@ def test_suggest_picks_top_actionable_target():
     assert s["action"] == "evolve"
     assert s["priority"] > 0
     assert "reason" in s
+    assert "evidence" in s
 
 
 def test_suggest_is_none_when_nothing_is_actionable():
@@ -165,11 +174,25 @@ def test_suggest_is_none_when_nothing_is_actionable():
 
 
 def test_suggest_requires_real_usage():
-    # used but with no golden set -> "measure" IS actionable
-    usage = aggregate([_ev("skill_loaded", "unmeasured")], now=NOW)
+    # used but with no golden set -> "measure" IS actionable — but only once
+    # the accumulated-experience bar is cleared.
+    usage = aggregate(
+        [
+            _ev("skill_loaded", "unmeasured", session="s1"),
+            _ev("skill_loaded", "unmeasured", session="s2"),
+            _ev("skill_failed", "unmeasured", session="s2"),
+        ],
+        now=NOW,
+    )
     s = suggest(triage(usage=usage, facts={"unmeasured": _facts("unmeasured")}))
     assert s is not None and s["action"] == "measure"
     # but a row with usage 0 must never be suggested
     rows = triage(usage=aggregate([], now=NOW), facts={"unmeasured": _facts("unmeasured")})
     assert all(r.usage == 0 for r in rows)
     assert suggest(rows) is None
+
+
+def test_suggest_skips_skills_below_the_evidence_bar():
+    """A skill used in one session must not be named by the suggestion."""
+    usage = aggregate([_ev("skill_loaded", "unmeasured", session="s1")], now=NOW)
+    assert suggest(triage(usage=usage, facts={"unmeasured": _facts("unmeasured")})) is None

@@ -1,7 +1,7 @@
 ---
 name: skill-evolution
-description: 'Two-layer skill self-improvement for Pi: Layer 1 runtime (the skill_manage extension that patches skills in-session and gates every NEW skill on user approval plus skill-forge''s lint gate, records per-skill usage telemetry, writes a triage digest at session end, and suggests the ranked next target in the prompt) and Layer 2 offline optimizer (DSPy+GEPA over SKILL.md bodies) with a monitor/triage step that ranks which skill to evolve first. Mine session history or golden JSONL into eval data, evolve the skill body under constraint gates (15KB cap, ≤1.2x growth, frontmatter contract, lint gate), and deploy as a local evolve/ branch for human review — never pushes. Use when asked to "optimize/evolve a skill", "improve a SKILL.md offline", "run layer-2", "which skill should I evolve", "triage digest", "pi-skill-evolution", "skill evolution", or about the skill_manage runtime layer. Always dry-run first; ask-user gate before any model spend; report +0.000 outcomes as honest no-ops.'
-version: 1.6.0
+description: 'Two-layer skill self-improvement for Pi: Layer 1 runtime (the skill_manage extension that patches skills in-session behind an accumulated-experience bar and user approval, records per-skill usage telemetry, writes a triage digest at session end, and suggests the ranked next target in the prompt) and Layer 2 offline optimizer (DSPy+GEPA over SKILL.md bodies) with a monitor/triage step that ranks which skill to evolve first. Mine session history or golden JSONL into eval data, evolve the skill body under constraint gates (15KB cap, ≤1.2x growth, frontmatter contract, lint gate), and deploy as a local evolve/ branch for human review — never pushes. Use when asked to "optimize/evolve a skill", "improve a SKILL.md offline", "run layer-2", "which skill should I evolve", "triage digest", "pi-skill-evolution", "skill evolution", or about the skill_manage runtime layer. Always dry-run first; ask-user gate before any model spend; report +0.000 outcomes as honest no-ops.'
+version: 1.7.0
 updated: "2026-10-28"
 triggers:
   - "evolve a skill"
@@ -50,12 +50,14 @@ skill-evolution/                      # = repo = package = deployed skill
 ├── layer1/                           # RUNTIME layer
 │   ├── extension/skill-memory.ts     # the Pi extension (source of truth)
 │   ├── agents-routing-section.md     # copy of ~/.pi/agent/AGENTS.md §7
-│   └── telemetry-schema.md           # the telemetry wire contract
+│   ├── telemetry-schema.md           # the telemetry wire contract
+│   └── digest-schema.md              # the session-end digest format
 ├── evolution/                        # OFFLINE layer (DSPy+GEPA)
-│   └── monitor/                      # telemetry reader + triage ranking
-├── bin/evolve, bin/triage, bin/skill-update-check.py
+│   └── monitor/                      # telemetry reader + triage + evidence bar
+├── references/                       # full detail (write policy, procedure, signatures)
+├── bin/evolve, bin/triage, bin/smoke-candidate, bin/skill-update-check.py
 ├── datasets/skills/<name>/golden.jsonl
-└── tests/
+└── tests/                            # pytest + the Node write-gate harness
 ```
 
 ## Layer 1 — runtime (`skill_manage`)
@@ -67,13 +69,13 @@ The extension is the **write side** of Pi's natively read-only skill system.
 | Tool | `skill_manage` — ops `create` / `patch` / `write_file` / `remove_file` / `delete`, applied ATOMICALLY (any failure rolls back every touched skill) |
 | Target root | `~/.agents/skills/` (extra roots via `PI_SKILL_MANAGE_ROOTS`, `:`-separated) |
 | Guardrails | name regex, realpath-escape guard, frontmatter contract (name == target, description required), 15KB cap, patch `old_string` must match exactly once, >5% growth warning, full-tree snapshot + rollback, symlink-aware delete (removes the deployment link, keeps the source tree) |
-| Create gate | `create` is gated twice: the user approves it (no UI = fail closed) and the candidate must pass skill-forge's lint gate in a temp staging dir. `patch` / `write_file` / `remove_file` are not gated. Policy: `references/layer1-write-policy.md` |
+| Create gate | Every skill write (`create` / `patch` / `write_file`, and a direct `edit` of a deployed `SKILL.md`) is gated twice: the accumulated-experience bar (`evolution/monitor/evidence.py` — ≥2 sessions AND a deficiency signal) and the user's approval (`ctx.ui.confirm`; no UI = fail closed). A `create` must also pass skill-forge's lint gate. Policy: `references/layer1-write-policy.md` |
 | Prompt injection | `before_agent_start` adds the `skill_memory` section (skills-first routing: task knowledge → skill, cross-session facts → wiki) |
 | Nudge | `agent_before_settle` delivers ONE learning nudge per session (≥ `PI_SKILL_MANAGE_NUDGE_MIN_TOOLS` tool calls, no learning tool used) |
 | Telemetry | Appends per-skill usage events (`skill_loaded` via `skill_search`, `skill_read` via `read` of a `SKILL.md`, `skill_managed` / `skill_failed` via `skill_manage`, `learning_tool`) to a JSONL outside the skill tree — the feed the monitor/triage step consumes. Schema: `layer1/telemetry-schema.md` |
 | Session-end digest | On `session_shutdown` the extension runs the monitor (`evolution.monitor.triage --json`, stdlib-only) and appends a dated digest: ranking, top action, delta vs the previous digest. Skipped on `/reload` |
 | Suggestion | One ranked target per session (`triage --suggest`) injected into the `skill_memory` prompt section. Pointer only — no spend, no automatic run |
-| Env knobs | `PI_SKILL_MANAGE_ROOTS`, `PI_SKILL_MANAGE_MAX_SKILL_BYTES` (15360), `PI_SKILL_MANAGE_ALLOW_CREATE` (=1 skips the create approval), `PI_SKILL_MANAGE_LINT_TIMEOUT_MS` (20000), `PI_SKILL_MANAGE_NUDGE_MIN_TOOLS` (6), `PI_SKILL_MANAGE_DISABLE_NUDGE`; telemetry + digest knobs in `references/monitor-and-digest.md` §4 |
+| Env knobs | `PI_SKILL_MANAGE_ROOTS`, `PI_SKILL_MANAGE_MAX_SKILL_BYTES` (15360), `PI_SKILL_MANAGE_ALLOW_CREATE` / `PI_SKILL_MANAGE_ALLOW_REVISION` (=1 skips that approval), `PI_SKILL_EVIDENCE_MIN_*` (the bar), `PI_SKILL_MANAGE_NUDGE_MIN_TOOLS` (6), `PI_SKILL_MANAGE_DISABLE_NUDGE`; the full list is in `references/layer1-write-policy.md` and `references/monitor-and-digest.md` §4 |
 
 **Deployment** — the live file is a symlink into this repo, never a copy
 (`ln -sfn <repo>/layer1/extension/skill-memory.ts ~/.pi/agent/extensions/`).
@@ -83,13 +85,26 @@ tool names"` — `skill_manage` must be present. Layer-1 code changes go
 through the same review and push as Layer-2 code; no second repo, no second
 copy to drift.
 
-## New skills are gated
+## Skill writes are gated
 
-A new skill needs **the user's approval** (`create` asks via `ctx.ui.confirm`;
-no UI = fail closed) and must **pass skill-forge's lint gate** in a temp
-staging dir: frontmatter with name/description/version/triggers, a `README.md`
-shipped in the same batch, and `skill-forge` in the frontmatter `skills:` list.
-Patching an existing skill is not gated — prefer it. Details:
+A new skill is the only unbounded growth in the runtime loop: Pi loads every
+skill at every session start, so a skill that is never used again is dead
+weight forever, and a revision made in an unrelated session leaks into that
+session's handoff. Every skill write — `create`, `patch`, `write_file`, and
+a direct `edit` of a deployed `SKILL.md` — passes two gates:
+
+1. **The accumulated-experience bar** (`evolution/monitor/evidence.py`): a
+   conclusion needs accumulated experience, not one session's impression.
+   *Revise* only a skill used across ≥2 sessions that also shows a deficiency
+   signal (revisited ≥3 times in one session, a failed write, proposed twice);
+   *create* only when the same need was proposed in ≥2 independent sessions.
+2. **The user's permission** (`ctx.ui.confirm`; no UI = fail closed). The
+   agent cannot self-authorise a skill write.
+
+A `create` must additionally follow the skill-forge convention (frontmatter
+with name/description/version/triggers, a `README.md` in the same batch, and
+`skill-forge` in the frontmatter `skills:` list) and pass skill-forge's
+linter in a temp staging dir. Policy, knobs, failure signatures:
 `references/layer1-write-policy.md`.
 
 ## Session-end digest
@@ -148,36 +163,23 @@ bin/evolve --skill <name> --eval-source golden \
 
 ## Procedure
 
-1. **Dry-run always.** `--dry-run` validates skill resolution, size/frontmatter
-   constraints, lint-gate detection, and the mined pair count — no API cost.
-   The mined count must be plausible (tens for any used skill); if it prints
-   **0, treat it as a BUG, not a result** (a miner regression shipped as "0 for
-   every skill" and looked like an empty result).
-2. **Ask-user gate before any real run.** Evidence + Recommend + Options:
-   - Model = the cost decision: `ollama_chat/<model>` (e.g.
-     `gemma4:31b-cloud`, ~2 min per 5 iterations) vs `openai/gpt-4.1`
-     (~$2–10/run). Env: `PI_EVOLUTION_OPTIMIZER` / `PI_EVOLUTION_EVAL`.
-   - Eval source + iterations (default 10; first runs 5).
-3. **Run.** GEPA runs with `max_metric_calls = iterations × 10`, 4 threads.
-4. **Interpret honestly.** The report prints baseline vs evolved holdout
-   scores + bytes. `+0.000` / "nothing deployed" is a CORRECT no-op outcome —
-   report it as such; do not retry silently hoping for a better number.
-   **Distrust any reported improvement when `evolved_bytes == baseline_bytes`**
-   — MIPROv2 mutates only its proposal instruction, so a byte-identical body
-   makes the delta pure noise.
-5. **Review/merge (human, mandatory).** Deployment lands either on a local
-   `evolve/<skill>-<ts>` branch in THIS repo (for skills symlinked from here —
-   reads as LOCAL-AHEAD to update-check) or as `output/<skill>/<ts>/` copies.
-   Never push. Merge or `git branch -D <branch>` after review.
-6. **After any deploy() run: `git symbolic-ref HEAD`** — deploy leaves the repo
-   ON the evolve branch even when commit fails; Layer-1 patches applied
-   there land in the wrong branch (bitten before). Switch back to master first.
-7. **Smoke the candidate (`--smoke`).** Lint checks structure; it cannot
-   check that the commands the skill tells the agent to run actually work.
-   `bin/smoke-candidate` extracts them, runs the allowlisted ones, and
-   rejects a candidate whose commands fail. A candidate can beat the
-   baseline and still ship a broken command — the smoke gate is the only
-   check that catches that.
+Full detail: `references/layer2-procedure.md`. The seven steps, in one line
+each:
+
+1. **Dry-run always.** `--dry-run` costs nothing; a mined count of **0 is a
+   BUG, not a result**.
+2. **Ask-user gate before any real run.** Evidence + Recommend + Options —
+   the model is the cost decision (`ollama_chat/<model>` vs `openai/gpt-4.1`).
+3. **Run.** GEPA, `max_metric_calls = iterations × 10`, 4 threads.
+4. **Interpret honestly.** `+0.000` / "nothing deployed" is a CORRECT no-op —
+   report it, do not retry. Distrust a delta when `evolved_bytes ==
+   baseline_bytes` (the body is byte-identical; the delta is noise).
+5. **Review/merge (human, mandatory).** A local `evolve/<skill>-<ts>` branch
+   or an `output/<skill>/<ts>/` copy. Never push.
+6. **After any deploy() run: `git symbolic-ref HEAD`** — deploy leaves the
+   repo on the evolve branch even when the commit fails.
+7. **Smoke the candidate (`--smoke`).** Lint cannot check that the skill's
+   commands run; `bin/smoke-candidate` does.
 
 ## Signature library — known failure signatures
 

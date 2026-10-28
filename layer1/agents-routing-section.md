@@ -19,28 +19,31 @@ extension's injected text (the `before_agent_start` handler in
 Task knowledge has a home; global facts have a different one:
 
 - **Skills** (`skill_manage` tool): procedures, workflows, pitfalls, and the
-  user's corrections *for that kind of work*. When you work out a
-  non-trivial workflow, **patch an existing skill** (`skill_manage`
-  action=`patch`) instead of re-explaining the fix each session. Skills land
-  in `~/.agents/skills/` and Pi loads them natively at every session start.
-  Discipline: lessons, not logs (imperative rule + why, one rule per lesson,
-  no dates/PR numbers); trigger-style description (first ~57 chars
-  self-contained); SKILL.md ≤ 15KB, move detail into `references/`.
-- **New skills are gated**: a `create` op asks the user for approval first
-  (no UI = refused) and the new skill must follow the skill-forge convention
-  — frontmatter with name/description/version/triggers, a `README.md`, and
-  `skill-forge` in the frontmatter `skills:` list. Prefer patching an
-  existing skill: a skill that is never used again is dead weight in every
-  later session.
+  user's corrections *for that kind of work*. Prefer **patching an existing
+  skill** over creating one: a skill that is never used again is dead weight
+  in every later session. Before any skill write, two things must hold — the
+  **accumulated-experience bar** (the skill was used across several sessions
+  AND shows a real deficiency: revisited repeatedly, a failed write, or
+  already proposed twice) and the **user's approval**. The tool enforces
+  both, so a write that fails the bar is refused: do not retry, and do not
+  work around it with a plain edit of the SKILL.md — a direct edit of a
+  deployed skill is gated the same way. Skills land in `~/.agents/skills/`
+  and Pi loads them natively at every session start. Discipline: lessons, not
+  logs (imperative rule + why, one rule per lesson, no dates/PR numbers);
+  trigger-style description (first ~57 chars self-contained); SKILL.md ≤
+  15KB, move detail into `references/`. A new skill must follow the
+  skill-forge convention (frontmatter with name/description/version/triggers,
+  a README.md, and `skill-forge` in the frontmatter `skills:` list).
 - **Wiki** (`wiki_retro` / `wiki_observe`): facts that apply to EVERY
-  session regardless of task — who the user is, environment facts,
-  standing conventions, project-level insights.
+  session regardless of task — who the user is, environment facts, standing
+  conventions, project-level insights. This is the **default sink**: a
+  one-session observation goes here, not into a skill.
 - Never write imperatives into memory/profile stores ("Always respond
   concisely" ✗) — they get re-read as directives; write declarative facts
   ("User prefers concise responses" ✓).
 - A fact stale within a week belongs in session history; after difficult
   or iterative tasks, offer to save the approach as a skill (ask before
-  creating a new one).
+  creating a new one — and only when the accumulated-experience bar is met).
 ```
 
 ## Where the Layer-1 code lives

@@ -22,7 +22,13 @@
  *   PI_SKILL_MANAGE_ALLOW_CREATE       =1 to skip the user-approval prompt for
  *                                        `create` (unattended runs only; the
  *                                        skill-forge lint gate still applies)
+ *   PI_SKILL_MANAGE_ALLOW_REVISION      =1 to skip the user-approval prompt for
+ *                                        `patch` / `write_file` (unattended runs)
  *   PI_SKILL_MANAGE_LINT_TIMEOUT_MS    default 20000 (skill-forge lint budget)
+ *   PI_SKILL_MANAGE_EVIDENCE_MIN_SESSIONS  default 2 (breadth of the evidence bar)
+ *   PI_SKILL_MANAGE_EVIDENCE_MIN_REVISITS  default 3 (uses in one session)
+ *   PI_SKILL_MANAGE_EVIDENCE_MIN_FAILURES  default 1 (failed writes)
+ *   PI_SKILL_MANAGE_EVIDENCE_MIN_PROPOSALS default 2 (sessions that proposed it)
  *   PI_SKILL_MANAGE_NUDGE_MIN_TOOLS    default 6 (0 disables trigger floor)
  *   PI_SKILL_MANAGE_DISABLE_NUDGE      =1 to disable the session-end nudge
  *   PI_SKILL_TELEMETRY                  =0 to disable per-skill usage telemetry
@@ -103,6 +109,33 @@ function skillFromSkillMdPath(p: string): string | undefined {
 	return NAME_RE.test(name) ? name : undefined;
 }
 
+/**
+ * True when `target` lives inside the session's working tree.
+ *
+ * A skill the agent is actively developing — its source tree IS the session's
+ * cwd — is ordinary work. Only a write to a skill definition *outside* the
+ * session's own tree is a runtime write, and only that is gated.
+ */
+function isInsideWorkingTree(target: string, cwd: string | undefined): boolean {
+	if (!cwd) return false;
+	try {
+		const realTarget = fs.realpathSync(path.dirname(target));
+		const realCwd = fs.realpathSync(cwd);
+		const rel = path.relative(realCwd, realTarget);
+		return !rel.startsWith("..") && !path.isAbsolute(rel);
+	} catch {
+		// The path may not exist yet (a `write` of a new file) — fall back to
+		// a lexical comparison against the cwd.
+		try {
+			const abs = path.resolve(target);
+			const rel = path.relative(path.resolve(cwd), abs);
+			return !rel.startsWith("..") && !path.isAbsolute(rel);
+		} catch {
+			return false;
+		}
+	}
+}
+
 /** Skill name from a skill_search load call (name field, or path to a skill dir/SKILL.md). */
 function skillFromLoadInput(input: Record<string, unknown>): string | undefined {
 	const name = typeof input.name === "string" ? input.name.trim() : "";
@@ -136,7 +169,22 @@ function recordToolUsage(toolName: string, rawInput: unknown): void {
 				const action = typeof op.action === "string" ? op.action : "";
 				if (!name) continue;
 				record({ event: "skill_managed", skill: name, op: action, source: "skill_manage" });
+				// A proposal is a conclusion — the agent decided a skill should
+				// change. It is the accumulated evidence behind the create bar.
+				if (action === "create" || action === "patch") {
+					record({ event: "skill_proposed", skill: name, op: action, source: "skill_manage" });
+				}
 			}
+			return;
+		}
+		if (toolName === "edit" || toolName === "write") {
+			// A direct edit/write of a deployed SKILL.md is a skill revision
+			// that bypasses the `skill_manage` gate. Record it so the
+			// evidence bar can see it, and let the tool_call gate below
+			// require approval for it.
+			const p = typeof (input as { path?: unknown }).path === "string" ? (input as { path: string }).path : "";
+			const name = skillFromSkillMdPath(p);
+			if (name) record({ event: "skill_managed", skill: name, op: "direct_edit", source: toolName });
 			return;
 		}
 		if (/^wiki_(retro|observe)$/.test(toolName)) {
@@ -477,9 +525,11 @@ function parseFrontmatter(raw: string): { name?: string; description?: string } 
 // that already exists cannot pile up new ones.
 
 const ALLOW_CREATE = process.env.PI_SKILL_MANAGE_ALLOW_CREATE === "1";
+const ALLOW_REVISION = process.env.PI_SKILL_MANAGE_ALLOW_REVISION === "1";
 const LINT_TIMEOUT_MS = Number(process.env.PI_SKILL_MANAGE_LINT_TIMEOUT_MS ?? "20000");
 const FORGE_SKILL = "skill-forge";
 const LINT_PROFILE = "tool-skill";
+const EVIDENCE_TIMEOUT_MS = Number(process.env.PI_SKILL_MANAGE_EVIDENCE_TIMEOUT_MS ?? "15000");
 
 /** Locate skill-forge's structural linter across the skill roots. */
 function findSkillForgeLint(): string | null {
@@ -568,43 +618,152 @@ function collectCreatePlans(ops: { action: string; name: string; content?: strin
 
 type GateCtx = { hasUI?: boolean; ui?: { confirm?: (title: string, message: string) => Promise<boolean> } };
 
-/**
- * The two create gates. Throws with an actionable message; the caller turns
- * that into the atomic "nothing was written" failure.
- */
-async function gateCreates(ctx: GateCtx, plans: CreatePlan[]): Promise<void> {
-	if (!plans.length) return;
+// ── the accumulated-experience bar ─────────────────────────────────────────
+//
+// The evidence model lives in the monitor (evolution/monitor/evidence.py) so
+// the Python triage and the TypeScript gate cannot drift: the extension asks
+// the monitor whether a conclusion is supported, and the monitor answers from
+// the same telemetry JSONL it reads for triage.
+//
+// A skill write is allowed only when the telemetry shows accumulated
+// experience of a real deficiency — a skill used in one session is a one-off,
+// and a well-used skill needs no work. This is what stops an unrelated
+// session (one that merely loaded a skill) from ending up with a skill
+// revision, and a revision of that skill then landing in that session's
+// handoff.
 
-	// ── gate 1: the user approves every new skill ──────────────────────
-	if (!ALLOW_CREATE) {
-		if (!ctx?.hasUI || typeof ctx.ui?.confirm !== "function") {
-			throw new Error(
-				"create: a new skill needs the user's approval and this session has no UI to ask " +
-					"(print / RPC-less mode). Run the session interactively, or set " +
-					"PI_SKILL_MANAGE_ALLOW_CREATE=1 to allow unattended creation.",
-			);
-		}
-		const lines = plans.map((p) => {
-			const fm = parseGateFrontmatter(p.content);
-			const desc = (fm.description ?? "(no description)").replace(/\s+/g, " ").slice(0, 160);
-			return `• ${p.name} — ${desc}\n  ${Buffer.byteLength(p.content, "utf8")} B of SKILL.md`;
-		});
-		const approved = await ctx.ui.confirm(
-			`Create ${plans.length} new skill${plans.length > 1 ? "s" : ""}?`,
-			[
-				"Pi loads every skill at each session start, so a skill that is never used again is dead weight forever.",
-				"A new skill must follow the skill-forge convention: frontmatter (name, description, version, triggers),",
-				"a README.md, and `skill-forge` in the frontmatter `skills:` list — the tool lints it before it lands.",
-				"",
-				...lines,
-				"",
-				"Approve?",
-			].join("\n"),
+type Evidence = {
+	eligible: boolean;
+	reason: string;
+	use_sessions?: number;
+	revisits?: number;
+	failures?: number;
+	proposal_sessions?: number;
+	score?: number;
+};
+
+/** Ask the monitor whether the accumulated experience supports a conclusion. */
+function queryEvidence(root: string, skill: string, kind: "revise" | "create"): Evidence | null {
+	const venvPython = path.join(root, ".venv", "bin", "python");
+	const python = fs.existsSync(venvPython) ? venvPython : "python3";
+	try {
+		const res = spawnSync(
+			python,
+			["-m", "evolution.monitor.evidence", "--skill", skill, "--kind", kind, "--json"],
+			{
+				cwd: root,
+				env: { ...process.env, PYTHONPATH: root },
+				encoding: "utf8",
+				timeout: EVIDENCE_TIMEOUT_MS,
+				maxBuffer: 1024 * 1024,
+			},
 		);
-		if (!approved) throw new Error("create: declined by the user — nothing was written.");
+		if (res.status !== 0 || !res.stdout) return null;
+		const parsed = JSON.parse(res.stdout) as Evidence;
+		return parsed && typeof parsed.eligible === "boolean" ? parsed : null;
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * The accumulated-experience bar for one target.
+ *
+ * Returns an error string when the bar is not met (the write must be
+ * refused), or null when it is. `kind` is "revise" for an existing skill and
+ * "create" for a new one. A "create" has no usage history, so its bar is the
+ * agent's own repeated conclusion (the same name proposed in several
+ * independent sessions).
+ */
+function evidenceRefusal(root: string | null, skill: string, kind: "revise" | "create"): string | null {
+	if (!root) return null; // the monitor is unreachable — permission still applies
+	const evidence = queryEvidence(root, skill, kind);
+	if (!evidence || evidence.eligible) return null;
+	return (
+		`${kind}: '${skill}' does not clear the accumulated-experience bar — ${evidence.reason}. ` +
+		"Revising or creating a skill is a conclusion, not a reflex: it needs repeated evidence that the " +
+		"skill is deficient (used across several sessions AND revisited / failed / already proposed), not " +
+		"one session's impression. Record the observation in the wiki (wiki_observe) and let the bar be " +
+		"crossed by real use."
+	);
+}
+
+/**
+ * The user's permission for a batch of writes. One dialog for the whole
+ * batch (a two-skill create asks once, not twice). Returns an error string
+ * when the batch must be refused, or null when it may proceed.
+ */
+async function permissionRefusal(
+	ctx: GateCtx,
+	kind: "revise" | "create",
+	details: string[],
+): Promise<string | null> {
+	if (!details.length) return null;
+	if (kind === "create" ? ALLOW_CREATE : ALLOW_REVISION) return null;
+	if (!ctx?.hasUI || typeof ctx.ui?.confirm !== "function") {
+		return (
+			`${kind}: a skill write needs the user's approval and this session has no UI to ask ` +
+			"(print / RPC-less mode). Run the session interactively, or set " +
+			(kind === "create" ? "PI_SKILL_MANAGE_ALLOW_CREATE=1" : "PI_SKILL_MANAGE_ALLOW_REVISION=1") +
+			" to allow unattended writes."
+		);
+	}
+	const noun = kind === "create" ? "new skill" : "existing skill";
+	const title = `${kind === "create" ? "Create" : "Revise"} ${details.length} ${noun}${details.length > 1 ? "s" : ""}?`;
+	const body =
+		kind === "create"
+			? [
+					"Pi loads every skill at each session start, so a skill that is never used again is dead weight forever.",
+					"A new skill must follow the skill-forge convention: frontmatter (name, description, version, triggers),",
+					"a README.md, and `skill-forge` in the frontmatter `skills:` list — the tool lints it before it lands.",
+				].join("\n")
+			: "A skill revision changes what every later session does with that skill.";
+	const approved = await ctx.ui.confirm(title, [body, "", ...details, "", "Approve?"].join("\n"));
+	if (!approved) {
+		return `${kind}: not approved by the user — nothing was written.`;
+	}
+	return null;
+}
+
+/**
+ * The write gates. Throws with an actionable message; the caller turns
+ * that into the atomic "nothing was written" failure.
+ *
+ * Three gates, in order:
+ *   1. the accumulated-experience bar (a conclusion needs accumulated
+ *      experience, not one session's impression),
+ *   2. the user's permission,
+ *   3. the skill-forge lint gate (new skills only).
+ */
+async function gateCreates(ctx: GateCtx, plans: CreatePlan[], revisionTargets: string[], root: string | null): Promise<void> {
+	// ── gate 1: the accumulated-experience bar ─────────────────────────
+	for (const plan of plans) {
+		const refusal = evidenceRefusal(root, plan.name, "create");
+		if (refusal) throw new Error(refusal);
+	}
+	for (const name of revisionTargets) {
+		const refusal = evidenceRefusal(root, name, "revise");
+		if (refusal) throw new Error(refusal);
 	}
 
-	// ── gate 2: skill-forge conformance, staged before any live write ──
+	// ── gate 2: the user's permission (one dialog per batch) ────────────
+	const createDetails = plans.map((p) => {
+		const fm = parseGateFrontmatter(p.content);
+		const desc = (fm.description ?? "(no description)").replace(/\s+/g, " ").slice(0, 160);
+		return `• ${p.name} — ${desc}\n  ${Buffer.byteLength(p.content, "utf8")} B of SKILL.md`;
+	});
+	const createRefusal = await permissionRefusal(ctx, "create", createDetails);
+	if (createRefusal) throw new Error(createRefusal);
+	const revisionRefusal = await permissionRefusal(
+		ctx,
+		"revise",
+		revisionTargets.map((name) => `• ${name} — revising an existing skill's body or supporting files`),
+	);
+	if (revisionRefusal) throw new Error(revisionRefusal);
+
+	if (!plans.length) return;
+
+	// ── gate 3: skill-forge conformance, staged before any live write ──
 	const lint = findSkillForgeLint();
 	if (!lint) {
 		throw new Error(
@@ -824,22 +983,63 @@ export default function skillMemoryExtension(pi: ExtensionAPI) {
 		record({ event: "skill_failed", skill: m?.[1], op: "unknown", source: "skill_manage" });
 	});
 
+	// ── direct-edit gate: a SKILL.md written with `edit`/`write` ───────
+	//
+	// The `skill_manage` gates only cover writes that go through the tool.
+	// A plain `edit` of a deployed SKILL.md is a skill revision too — and in
+	// the OceanDecade round that is exactly how `design-pack` was revised
+	// inside a session that was about a proposal, which then landed in that
+	// session's handoff. So the same two gates apply here: the
+	// accumulated-experience bar, then the user's permission.
+	//
+	// Only files that ARE a skill definition are gated: a SKILL.md under a
+	// skill root. Everything else the agent edits is untouched.
+	pi.on("tool_call", async (event, ctx) => {
+		const toolName = String((event as { toolName?: string }).toolName ?? "");
+		if (toolName !== "edit" && toolName !== "write") return;
+		const input = (event as { input?: { path?: unknown } }).input;
+		const target = typeof input?.path === "string" ? input.path : "";
+		if (!target) return;
+		const skill = skillFromSkillMdPath(target);
+		if (!skill) return;
+		// A skill the agent is actively developing (its own source tree is the
+		// session's cwd) is ordinary work, not a runtime write.
+		if (isInsideWorkingTree(target, ctx?.cwd)) return;
+
+		const root = resolveEvolutionRoot();
+		const refusal = evidenceRefusal(root, skill, "revise");
+		if (refusal) {
+			return { block: true, reason: refusal };
+		}
+		const permission = await permissionRefusal(ctx, "revise", [
+			`• ${skill} — ${target}\n  A direct edit of a skill definition is a skill revision.`,
+		]);
+		if (permission) {
+			return { block: true, reason: permission };
+		}
+	});
+
 	// ── prompt guidance section (Hermes SKILLS_GUIDANCE analog) ───────────
 	pi.on("before_agent_start", (event) => {
 		const sections = event.systemPromptOptions?.sections;
 		if (!sections) return;
 		sections.skill_memory = [
-			"When you work out a non-trivial workflow, persist it: PATCH an existing skill with skill_manage (no approval needed),",
-			"and only CREATE a new skill after the user approves it (ask first, e.g. via ask_user_question). A new skill",
-			"must follow the skill-forge convention — frontmatter with name, description, version and triggers, a README.md,",
-			"and `skill-forge` in the frontmatter `skills:` list — and the tool lints it (skill-forge/bin/skill-lint.py)",
-			"before it lands. Skills that are never used again are dead weight, so prefer patching over creating.",
-			"If a skill you loaded was missing steps or wrong, patch it (skill_manage action='patch') instead of",
-			"re-explaining the fix each session. Routing: task-specific knowledge — procedures, pitfalls, and the",
-			"user's corrections for that kind of work — belongs in skills; facts that apply to EVERY session",
-			"(who the user is, environment facts, standing conventions) belong in durable memory or the wiki",
-			"(wiki_retro when llm-wiki is available). Write entries as declarative facts, not imperatives.",
-			"After difficult or iterative tasks, offer to save the approach as a skill (ask before creating a new one).",
+			"Skills-first for task knowledge; the WIKI is the default sink for anything that applies to every session.",
+			"Before you change a skill, two things must hold: (1) the accumulated-experience bar is met — the skill",
+			"was used across several sessions and shows a real deficiency (revisited repeatedly, a failed write, or",
+			"already proposed twice), and (2) the user approves. The skill_manage tool enforces both, so a write that",
+			"fails the bar will be refused: do not retry, and do not work around it with a plain edit of the SKILL.md.",
+			"If a skill you loaded was missing steps or wrong, note it (wiki_observe) and let the evidence accumulate;",
+			"the bar is crossed by real use, not by one session's impression. Prefer a wiki note to a skill revision —",
+			"a skill that is never used again is dead weight in every later session.",
+			"Creating a skill is the heaviest option: it must follow the skill-forge convention (frontmatter with name,",
+			"description, version and triggers, a README.md, and `skill-forge` in the frontmatter `skills:` list), and",
+			"it needs the same accumulated evidence (the same need proposed in several independent sessions) plus the",
+			"user's explicit approval.",
+			"Routing: task-specific knowledge — procedures, pitfalls, and the user's corrections for that kind of work —",
+			"belongs in skills; facts that apply to EVERY session (who the user is, environment facts, standing",
+			"conventions) belong in durable memory or the wiki (wiki_retro when llm-wiki is available). Write entries as",
+			"declarative facts, not imperatives.",
 		].join("\n");
 		const extra = suggestionLines();
 		if (extra.length) sections.skill_memory += "\n" + extra.join("\n");
@@ -855,11 +1055,13 @@ export default function skillMemoryExtension(pi: ExtensionAPI) {
 				customType: "skill-memory-nudge",
 				content:
 					"[skill-memory nudge] This session involved substantial multi-step work and used no learning " +
-					"tools yet. Before finishing: if any workflow discovered here will recur, persist it — patch an " +
-					"existing skill with skill_manage (procedures, pitfalls, user corrections), or, for something that " +
-					"needs a skill of its own, ASK the user before creating one (a new skill must follow the " +
-					"skill-forge convention and pass its lint gate). Either save what is worth saving via " +
-					"skill_manage, or state plainly that nothing reusable emerged. Do not restate the transcript.",
+					"tools yet. Before finishing: if this session uncovered a durable FACT, record it with wiki_retro / " +
+					"wiki_observe — that is the default sink and needs no approval. Only consider a skill write if the " +
+					"accumulated-experience bar is actually met: the skill was used across several sessions AND shows " +
+					"a real deficiency (revisited repeatedly, a failed write, or already proposed twice), and the user " +
+					"approves. One session's impression is not a conclusion, and a skill that is never used again is " +
+					"dead weight in every later session. Either save what is worth saving, or state plainly that " +
+					"nothing reusable emerged. Do not restate the transcript.",
 				display: false,
 			},
 			{ triggerTurn: true },
@@ -950,9 +1152,29 @@ export default function skillMemoryExtension(pi: ExtensionAPI) {
 					snapshotTree(rootEntry, snapshots);
 				}
 
-				// ── 1b. Layer-1 write policy: a new skill needs the user's approval
-				//        and must pass skill-forge's linter before anything is written.
-				await gateCreates(ctx, collectCreatePlans(params.operations as { action: string; name: string; content?: string; file_path?: string }[]));
+				// ── 1b. Layer-1 write policy: a skill write needs accumulated
+				//        experience behind it AND the user's approval; a new
+				//        skill must also pass skill-forge's linter before
+				//        anything is written.
+				const createPlans = collectCreatePlans(
+					params.operations as { action: string; name: string; content?: string; file_path?: string }[],
+				);
+				const creatingNames = new Set(createPlans.map((p) => p.name));
+				// A revision is a write to an EXISTING skill. Ops that belong to
+				// a skill this batch is creating are part of the create, not a
+				// separate revision.
+				const revisionTargets = [
+					...new Set(
+						params.operations
+							.filter(
+								(op) =>
+									(op.action === "patch" || op.action === "write_file" || op.action === "remove_file") &&
+									!creatingNames.has(op.name),
+							)
+							.map((op) => op.name),
+					),
+				];
+				await gateCreates(ctx, createPlans, revisionTargets, resolveEvolutionRoot());
 
 				// ── 2. Apply ops in order ────────────────────────────────────
 				try {
