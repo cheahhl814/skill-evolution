@@ -11,10 +11,18 @@
  *     frontmatter contract, atomic all-or-nothing ops, trigger descriptions.
  *   - Routing doctrine adapted from Hermes build_memory_guidance():
  *     skills-first for task knowledge; every-session facts to wiki/memory.
+ *   - A NEW skill is the only unbounded growth in this loop, so `create` is
+ *     gated twice: the user approves it, and the candidate must pass
+ *     skill-forge's structural linter (see "Layer-1 write policy" below).
+ *     `patch` / `write_file` / `remove_file` are not gated.
  *
  * Config via env:
  *   PI_SKILL_MANAGE_ROOTS              ':'-separated extra skill roots
  *   PI_SKILL_MANAGE_MAX_SKILL_BYTES    default 15360
+ *   PI_SKILL_MANAGE_ALLOW_CREATE       =1 to skip the user-approval prompt for
+ *                                        `create` (unattended runs only; the
+ *                                        skill-forge lint gate still applies)
+ *   PI_SKILL_MANAGE_LINT_TIMEOUT_MS    default 20000 (skill-forge lint budget)
  *   PI_SKILL_MANAGE_NUDGE_MIN_TOOLS    default 6 (0 disables trigger floor)
  *   PI_SKILL_MANAGE_DISABLE_NUDGE      =1 to disable the session-end nudge
  *   PI_SKILL_TELEMETRY                  =0 to disable per-skill usage telemetry
@@ -445,6 +453,238 @@ function parseFrontmatter(raw: string): { name?: string; description?: string } 
 	return { name: get("name"), description: get("description") };
 }
 
+// ── Layer-1 write policy: a new skill needs approval + skill-forge conformance ─
+//
+// A new skill is the only unbounded growth in this loop. Pi loads every skill
+// at every session start, so a skill that is never used again is dead weight
+// forever, and the clutter cannot be undone without deleting files by hand.
+// Two gates protect the live tree, and both live in the TOOL rather than in
+// the agent's judgement:
+//
+//   1. Approval    — `create` asks the user (ctx.ui.confirm) before a single
+//                    byte is written. A session with no UI fails CLOSED; the
+//                    unattended opt-out is the explicit env var
+//                    PI_SKILL_MANAGE_ALLOW_CREATE=1.
+//   2. Conformance — the candidate is staged in a temp dir and must pass
+//                    skill-forge's structural linter (bin/skill-lint.py,
+//                    tool-skill profile) before it reaches ~/.agents/skills.
+//                    skill-forge is the external dependency that owns the
+//                    contract: frontmatter (name, description, version,
+//                    triggers), a README.md public face, and a
+//                    `skills: [skill-forge]` dependency declaration.
+//
+// `patch` / `write_file` / `remove_file` are NOT gated: correcting a skill
+// that already exists cannot pile up new ones.
+
+const ALLOW_CREATE = process.env.PI_SKILL_MANAGE_ALLOW_CREATE === "1";
+const LINT_TIMEOUT_MS = Number(process.env.PI_SKILL_MANAGE_LINT_TIMEOUT_MS ?? "20000");
+const FORGE_SKILL = "skill-forge";
+const LINT_PROFILE = "tool-skill";
+
+/** Locate skill-forge's structural linter across the skill roots. */
+function findSkillForgeLint(): string | null {
+	for (const root of SKILL_ROOTS) {
+		const p = path.join(root, FORGE_SKILL, "bin", "skill-lint.py");
+		if (fs.existsSync(p)) return p;
+	}
+	return null;
+}
+
+type GateFrontmatter = {
+	name?: string;
+	description?: string;
+	version?: string;
+	skills: string[];
+	triggers: string[];
+};
+
+/**
+ * Frontmatter fields the create gate needs. The linter does the real YAML
+ * parse; this is a deliberately small reader for the four keys the policy
+ * depends on, tolerant of both block lists and inline arrays.
+ */
+function parseGateFrontmatter(raw: string): GateFrontmatter {
+	const out: GateFrontmatter = { skills: [], triggers: [] };
+	if (!raw.trimStart().startsWith("---")) return out;
+	const m = raw.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+	if (!m) return out;
+	const block = m[1];
+	const scalar = (key: string): string | undefined => {
+		const line = block.match(new RegExp(`^${key}:\\s*(?:"([^"]*)"|'([^']*)'|(.*))$`, "m"));
+		return (line?.[1] ?? line?.[2] ?? line?.[3])?.trim();
+	};
+	out.name = scalar("name");
+	out.description = scalar("description");
+	out.version = scalar("version");
+	const list = (key: string): string[] => {
+		const inline = block.match(new RegExp(`^${key}:\\s*\\[(.*)\\]$`, "m"));
+		if (inline) {
+			return inline[1]
+				.split(",")
+				.map((s) => s.trim().replace(/^["']|["']$/g, ""))
+				.filter(Boolean);
+		}
+		const lines = block.split(/\r?\n/);
+		const start = lines.findIndex((l) => new RegExp(`^${key}:\\s*$`).test(l));
+		if (start < 0) return [];
+		const items: string[] = [];
+		for (let i = start + 1; i < lines.length; i++) {
+			const item = lines[i].match(/^\s*-\s*(.+)$/);
+			if (!item) break;
+			items.push(item[1].trim().replace(/^["']|["']$/g, ""));
+		}
+		return items;
+	};
+	out.skills = list("skills");
+	out.triggers = list("triggers");
+	return out;
+}
+
+type CreatePlan = {
+	name: string;
+	content: string;
+	supporting: { file_path: string; content: string }[];
+};
+
+/**
+ * The `create` ops of a batch, each with the `write_file` ops that follow it
+ * for the same skill (a README.md lives there). Ops are matched in order, so
+ * a write_file only attaches to a create that already appeared.
+ */
+function collectCreatePlans(ops: { action: string; name: string; content?: string; file_path?: string }[]): CreatePlan[] {
+	const plans: CreatePlan[] = [];
+	for (const op of ops) {
+		if (op.action === "create") {
+			plans.push({ name: op.name, content: op.content ?? "", supporting: [] });
+		} else if (op.action === "write_file") {
+			const plan = plans.find((p) => p.name === op.name);
+			if (plan && op.file_path && typeof op.content === "string") {
+				plan.supporting.push({ file_path: op.file_path, content: op.content });
+			}
+		}
+	}
+	return plans;
+}
+
+type GateCtx = { hasUI?: boolean; ui?: { confirm?: (title: string, message: string) => Promise<boolean> } };
+
+/**
+ * The two create gates. Throws with an actionable message; the caller turns
+ * that into the atomic "nothing was written" failure.
+ */
+async function gateCreates(ctx: GateCtx, plans: CreatePlan[]): Promise<void> {
+	if (!plans.length) return;
+
+	// ── gate 1: the user approves every new skill ──────────────────────
+	if (!ALLOW_CREATE) {
+		if (!ctx?.hasUI || typeof ctx.ui?.confirm !== "function") {
+			throw new Error(
+				"create: a new skill needs the user's approval and this session has no UI to ask " +
+					"(print / RPC-less mode). Run the session interactively, or set " +
+					"PI_SKILL_MANAGE_ALLOW_CREATE=1 to allow unattended creation.",
+			);
+		}
+		const lines = plans.map((p) => {
+			const fm = parseGateFrontmatter(p.content);
+			const desc = (fm.description ?? "(no description)").replace(/\s+/g, " ").slice(0, 160);
+			return `• ${p.name} — ${desc}\n  ${Buffer.byteLength(p.content, "utf8")} B of SKILL.md`;
+		});
+		const approved = await ctx.ui.confirm(
+			`Create ${plans.length} new skill${plans.length > 1 ? "s" : ""}?`,
+			[
+				"Pi loads every skill at each session start, so a skill that is never used again is dead weight forever.",
+				"A new skill must follow the skill-forge convention: frontmatter (name, description, version, triggers),",
+				"a README.md, and `skill-forge` in the frontmatter `skills:` list — the tool lints it before it lands.",
+				"",
+				...lines,
+				"",
+				"Approve?",
+			].join("\n"),
+		);
+		if (!approved) throw new Error("create: declined by the user — nothing was written.");
+	}
+
+	// ── gate 2: skill-forge conformance, staged before any live write ──
+	const lint = findSkillForgeLint();
+	if (!lint) {
+		throw new Error(
+			`create: skill-forge's linter was not found (looked for ${FORGE_SKILL}/bin/skill-lint.py in ` +
+				`${SKILL_ROOTS.join(", ")}). A new skill must follow the skill-forge convention, so the gate ` +
+				"cannot be skipped.",
+		);
+	}
+	const stageRoot = fs.mkdtempSync(path.join(os.tmpdir(), "skill-manage-stage-"));
+	try {
+		for (const plan of plans) {
+			const fm = parseGateFrontmatter(plan.content);
+			const problems: string[] = [];
+			if (fm.name !== plan.name) {
+				problems.push(`frontmatter name is "${fm.name ?? "(none)"}" but the skill is named "${plan.name}"`);
+			}
+			if (!fm.version) problems.push("frontmatter has no `version` field (skill-forge requires one)");
+			if (!fm.triggers.length) problems.push("frontmatter has no `triggers` list (skill-forge requires one)");
+			if (!fm.skills.includes(FORGE_SKILL)) {
+				problems.push(`frontmatter must declare the external dependency — add:\n      skills:\n        - ${FORGE_SKILL}`);
+			}
+			if (!plan.supporting.some((f) => f.file_path.replace(/^\.\//, "") === "README.md")) {
+				problems.push("a new skill must ship a README.md — add a write_file op with file_path 'README.md' in the same batch");
+			}
+			if (problems.length) {
+				throw new Error(
+					`create: '${plan.name}' does not follow the skill-forge convention:\n  - ${problems.join("\n  - ")}`,
+				);
+			}
+
+			// stage the candidate tree
+			const stageDir = path.join(stageRoot, plan.name);
+			fs.mkdirSync(stageDir, { recursive: true });
+			fs.writeFileSync(path.join(stageDir, "SKILL.md"), plan.content);
+			for (const f of plan.supporting) {
+				const rel = f.file_path.replace(/^\.\//, "");
+				const dest = path.resolve(stageDir, rel);
+				if (!dest.startsWith(stageDir + path.sep)) {
+					throw new Error(`create: write_file path '${f.file_path}' escapes the skill dir`);
+				}
+				fs.mkdirSync(path.dirname(dest), { recursive: true });
+				fs.writeFileSync(dest, f.content);
+			}
+
+			// skill-forge's own linter decides — this extension never second-guesses it.
+			// --skill-dirs makes dependency resolution (C12) use the SAME roots this
+			// tool writes to, so a `skills:` entry must resolve where it will live.
+			const res = spawnSync(
+				"python3",
+				[lint, stageDir, "--profile", LINT_PROFILE, "--include-vendored", "--skill-dirs", SKILL_ROOTS.join(",")],
+				{
+					encoding: "utf8",
+					timeout: LINT_TIMEOUT_MS,
+					maxBuffer: 4 * 1024 * 1024,
+				},
+			);
+			if (res.error) {
+				throw new Error(`create: could not run the skill-forge linter: ${res.error.message}`);
+			}
+			if (res.status !== 0) {
+				const fails = (res.stdout ?? "")
+					.split(/\r?\n/)
+					.filter((l) => l.startsWith("FAIL"))
+					.map((l) => "  " + l.trim());
+				throw new Error(
+					`create: '${plan.name}' failed the skill-forge lint gate ` +
+						`(${FORGE_SKILL}/bin/skill-lint.py, ${LINT_PROFILE} profile) — nothing was written:\n` +
+						(fails.length ? fails.join("\n") : `  (linter exit ${res.status})\n${(res.stdout ?? "").trim()}`),
+				);
+			}
+		}
+	} finally {
+		try {
+			fs.rmSync(stageRoot, { recursive: true, force: true });
+		} catch {
+			/* best effort */
+		}
+	}
+}
+
 // ── atomic snapshot / rollback ──────────────────────────────────────────────
 
 type Snap = { kind: "file"; content: string } | { kind: "dir"; entries: string[] } | null;
@@ -500,12 +740,17 @@ const SKILL_MANAGE_DESCRIPTION =
 	"frontmatter name must equal the skill name; description required), patch (preferred: targeted " +
 	"old_string/new_string edit that must match exactly once; content-only 'create' would replace a whole " +
 	"file, so read the skill before rewriting), write_file / remove_file (supporting files), delete (sole op " +
-	"only; removes a symlinked deployment link without touching a linked source tree). Discipline: make the " +
+	"only; removes a symlinked deployment link without touching a linked source tree). DISCIPLINE: make the " +
 	"description's first ~57 chars a self-contained trigger ('Use when <trigger>. <behavior>.'); write " +
 	"lessons, not logs — imperative rule + why, one rule per lesson, no dates or PR numbers; extend existing " +
 	"references/ files before adding new ones; keep SKILL.md <= 15KB. Use after discovering a non-trivial " +
 	"workflow, when a skill you followed was missing or wrong, or to capture a reusable procedure for later " +
-	"sessions.";
+	"sessions. CREATING A SKILL IS GATED, PATCHING IS NOT: a create op asks the user for approval first " +
+	"(no UI = refused), and the candidate must pass skill-forge's structural linter (bin/skill-lint.py, " +
+	"tool-skill profile) before it lands: frontmatter needs name/description/version/triggers, a README.md " +
+	"must be written in the same batch (write_file op, file_path 'README.md'), and the frontmatter must " +
+	"declare the external dependency `skills: [skill-forge]`. So: patch an existing skill freely, but ask " +
+	"the user before creating a new one.";
 
 const SkillManageParams = Type.Object({
 	operations: Type.Array(
@@ -584,14 +829,17 @@ export default function skillMemoryExtension(pi: ExtensionAPI) {
 		const sections = event.systemPromptOptions?.sections;
 		if (!sections) return;
 		sections.skill_memory = [
-			"When you work out a non-trivial workflow, record it with skill_manage for future reuse: it writes",
-			"SKILL.md files under " + PRIMARY_ROOT + ", which Pi loads natively at every session start.",
+			"When you work out a non-trivial workflow, persist it: PATCH an existing skill with skill_manage (no approval needed),",
+			"and only CREATE a new skill after the user approves it (ask first, e.g. via ask_user_question). A new skill",
+			"must follow the skill-forge convention — frontmatter with name, description, version and triggers, a README.md,",
+			"and `skill-forge` in the frontmatter `skills:` list — and the tool lints it (skill-forge/bin/skill-lint.py)",
+			"before it lands. Skills that are never used again are dead weight, so prefer patching over creating.",
 			"If a skill you loaded was missing steps or wrong, patch it (skill_manage action='patch') instead of",
 			"re-explaining the fix each session. Routing: task-specific knowledge — procedures, pitfalls, and the",
 			"user's corrections for that kind of work — belongs in skills; facts that apply to EVERY session",
 			"(who the user is, environment facts, standing conventions) belong in durable memory or the wiki",
 			"(wiki_retro when llm-wiki is available). Write entries as declarative facts, not imperatives.",
-			"After difficult or iterative tasks, offer to save the approach as a skill.",
+			"After difficult or iterative tasks, offer to save the approach as a skill (ask before creating a new one).",
 		].join("\n");
 		const extra = suggestionLines();
 		if (extra.length) sections.skill_memory += "\n" + extra.join("\n");
@@ -607,10 +855,11 @@ export default function skillMemoryExtension(pi: ExtensionAPI) {
 				customType: "skill-memory-nudge",
 				content:
 					"[skill-memory nudge] This session involved substantial multi-step work and used no learning " +
-					"tools yet. Before finishing: if any workflow discovered here will recur, persist it — create or " +
-					"patch a skill with skill_manage (procedures, pitfalls, user corrections), or skip if it is purely " +
-					"session-bound. Either save what is worth saving via skill_manage, or state plainly that nothing " +
-					"reusable emerged. Do not restate the transcript.",
+					"tools yet. Before finishing: if any workflow discovered here will recur, persist it — patch an " +
+					"existing skill with skill_manage (procedures, pitfalls, user corrections), or, for something that " +
+					"needs a skill of its own, ASK the user before creating one (a new skill must follow the " +
+					"skill-forge convention and pass its lint gate). Either save what is worth saving via " +
+					"skill_manage, or state plainly that nothing reusable emerged. Do not restate the transcript.",
 				display: false,
 			},
 			{ triggerTurn: true },
@@ -641,13 +890,17 @@ export default function skillMemoryExtension(pi: ExtensionAPI) {
 		label: "Skill Manage",
 		description: SKILL_MANAGE_DESCRIPTION,
 		parameters: SkillManageParams,
-		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const logs: OpLog[] = [];
 			const snapshots = new Map<string, Snap>();
 			try {
 				// ── 1. Pre-flight: resolve every target, snapshot all affected trees
 				const touchedRoots = new Set<string>();
 				const planned: { op: (typeof params.operations)[number]; target: string; skillDir: string; root: string }[] = [];
+				// A `create` in this batch makes its skill dir a legal target for the
+				// `write_file` ops that follow it (a new skill ships its README.md
+				// the same way). Ops are applied in order, so the create lands first.
+				const pendingCreates = new Map<string, { skillDir: string; root: string }>();
 				for (const op of params.operations) {
 					const found = findSkill(op.name);
 					if (op.action === "create") {
@@ -656,9 +909,22 @@ export default function skillMemoryExtension(pi: ExtensionAPI) {
 						if (!NAME_RE.test(op.name)) throw new Error(`create: invalid skill name '${op.name}'`);
 						fs.mkdirSync(PRIMARY_ROOT, { recursive: true });
 						planned.push({ op, target: dir, skillDir: dir, root: PRIMARY_ROOT });
+						pendingCreates.set(op.name, { skillDir: dir, root: PRIMARY_ROOT });
 					} else {
 						if (!found) {
-							throw new Error(`${op.action}: skill '${op.name}' not found in: ${SKILL_ROOTS.join(", ")}`);
+							const pending = pendingCreates.get(op.name);
+							if (!pending) {
+								throw new Error(`${op.action}: skill '${op.name}' not found in: ${SKILL_ROOTS.join(", ")}`);
+							}
+							// target inside the skill this batch is about to create
+							const rel = op.file_path ?? "SKILL.md";
+							const base = pending.skillDir;
+							const fpath = path.resolve(base, rel);
+							if (!fpath.startsWith(base + path.sep) && fpath !== base) {
+								throw new Error(`${op.action}: file_path '${op.file_path}' escapes the skill dir`);
+							}
+							planned.push({ op, target: fpath, skillDir: base, root: pending.root });
+							continue;
 						}
 						touchedRoots.add(found.root);
 						if (op.action === "delete") {
@@ -683,6 +949,10 @@ export default function skillMemoryExtension(pi: ExtensionAPI) {
 					const rootEntry = path.join(p.root, p.op.name);
 					snapshotTree(rootEntry, snapshots);
 				}
+
+				// ── 1b. Layer-1 write policy: a new skill needs the user's approval
+				//        and must pass skill-forge's linter before anything is written.
+				await gateCreates(ctx, collectCreatePlans(params.operations as { action: string; name: string; content?: string; file_path?: string }[]));
 
 				// ── 2. Apply ops in order ────────────────────────────────────
 				try {

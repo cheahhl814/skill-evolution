@@ -1,7 +1,7 @@
 ---
 name: skill-evolution
-description: 'Two-layer skill self-improvement for Pi: Layer 1 runtime (the skill_manage extension that writes and patches skills in-session, records per-skill usage telemetry, writes a triage digest at session end, and suggests the ranked next target in the prompt) and Layer 2 offline optimizer (DSPy+GEPA over SKILL.md bodies) with a monitor/triage step that ranks which skill to evolve first. Mine session history or golden JSONL into eval data, evolve the skill body under constraint gates (15KB cap, ≤1.2x growth, frontmatter contract, lint gate), and deploy as a local evolve/ branch for human review — never pushes. Use when asked to "optimize/evolve a skill", "improve a SKILL.md offline", "run layer-2", "which skill should I evolve", "triage digest", "pi-skill-evolution", "skill evolution", or about the skill_manage runtime layer. Always dry-run first; ask-user gate before any model spend; report +0.000 outcomes as honest no-ops.'
-version: 1.5.0
+description: 'Two-layer skill self-improvement for Pi: Layer 1 runtime (the skill_manage extension that patches skills in-session and gates every NEW skill on user approval plus skill-forge''s lint gate, records per-skill usage telemetry, writes a triage digest at session end, and suggests the ranked next target in the prompt) and Layer 2 offline optimizer (DSPy+GEPA over SKILL.md bodies) with a monitor/triage step that ranks which skill to evolve first. Mine session history or golden JSONL into eval data, evolve the skill body under constraint gates (15KB cap, ≤1.2x growth, frontmatter contract, lint gate), and deploy as a local evolve/ branch for human review — never pushes. Use when asked to "optimize/evolve a skill", "improve a SKILL.md offline", "run layer-2", "which skill should I evolve", "triage digest", "pi-skill-evolution", "skill evolution", or about the skill_manage runtime layer. Always dry-run first; ask-user gate before any model spend; report +0.000 outcomes as honest no-ops.'
+version: 1.6.0
 updated: "2026-10-28"
 triggers:
   - "evolve a skill"
@@ -67,12 +67,13 @@ The extension is the **write side** of Pi's natively read-only skill system.
 | Tool | `skill_manage` — ops `create` / `patch` / `write_file` / `remove_file` / `delete`, applied ATOMICALLY (any failure rolls back every touched skill) |
 | Target root | `~/.agents/skills/` (extra roots via `PI_SKILL_MANAGE_ROOTS`, `:`-separated) |
 | Guardrails | name regex, realpath-escape guard, frontmatter contract (name == target, description required), 15KB cap, patch `old_string` must match exactly once, >5% growth warning, full-tree snapshot + rollback, symlink-aware delete (removes the deployment link, keeps the source tree) |
+| Create gate | `create` is gated twice: the user approves it (no UI = fail closed) and the candidate must pass skill-forge's lint gate in a temp staging dir. `patch` / `write_file` / `remove_file` are not gated. Policy: `references/layer1-write-policy.md` |
 | Prompt injection | `before_agent_start` adds the `skill_memory` section (skills-first routing: task knowledge → skill, cross-session facts → wiki) |
 | Nudge | `agent_before_settle` delivers ONE learning nudge per session (≥ `PI_SKILL_MANAGE_NUDGE_MIN_TOOLS` tool calls, no learning tool used) |
 | Telemetry | Appends per-skill usage events (`skill_loaded` via `skill_search`, `skill_read` via `read` of a `SKILL.md`, `skill_managed` / `skill_failed` via `skill_manage`, `learning_tool`) to a JSONL outside the skill tree — the feed the monitor/triage step consumes. Schema: `layer1/telemetry-schema.md` |
 | Session-end digest | On `session_shutdown` the extension runs the monitor (`evolution.monitor.triage --json`, stdlib-only) and appends a dated digest: ranking, top action, delta vs the previous digest. Skipped on `/reload` |
 | Suggestion | One ranked target per session (`triage --suggest`) injected into the `skill_memory` prompt section. Pointer only — no spend, no automatic run |
-| Env knobs | `PI_SKILL_MANAGE_ROOTS`, `PI_SKILL_MANAGE_MAX_SKILL_BYTES` (15360), `PI_SKILL_MANAGE_NUDGE_MIN_TOOLS` (6), `PI_SKILL_MANAGE_DISABLE_NUDGE`; telemetry + digest knobs in `references/monitor-and-digest.md` §4 |
+| Env knobs | `PI_SKILL_MANAGE_ROOTS`, `PI_SKILL_MANAGE_MAX_SKILL_BYTES` (15360), `PI_SKILL_MANAGE_ALLOW_CREATE` (=1 skips the create approval), `PI_SKILL_MANAGE_LINT_TIMEOUT_MS` (20000), `PI_SKILL_MANAGE_NUDGE_MIN_TOOLS` (6), `PI_SKILL_MANAGE_DISABLE_NUDGE`; telemetry + digest knobs in `references/monitor-and-digest.md` §4 |
 
 **Deployment** — the live file is a symlink into this repo, never a copy
 (`ln -sfn <repo>/layer1/extension/skill-memory.ts ~/.pi/agent/extensions/`).
@@ -81,6 +82,15 @@ layer1/extension/skill-memory.ts`, then `pi --print --no-session "list your
 tool names"` — `skill_manage` must be present. Layer-1 code changes go
 through the same review and push as Layer-2 code; no second repo, no second
 copy to drift.
+
+## New skills are gated
+
+A new skill needs **the user's approval** (`create` asks via `ctx.ui.confirm`;
+no UI = fail closed) and must **pass skill-forge's lint gate** in a temp
+staging dir: frontmatter with name/description/version/triggers, a `README.md`
+shipped in the same batch, and `skill-forge` in the frontmatter `skills:` list.
+Patching an existing skill is not gated — prefer it. Details:
+`references/layer1-write-policy.md`.
 
 ## Session-end digest
 
@@ -198,6 +208,8 @@ cause and fix) is in `references/signature-library.md`.
 - Layer 1 never writes outside the skill roots; every op is atomic and
   rollback-able, and the live extension is a symlink into this repo — this
   tree is the single source of truth for both layers.
+- A new skill is never written without the user's approval and never without
+  passing skill-forge's lint gate; patching an existing skill is ungated.
 - Nothing is ever pushed. Deployment = local branch in this repo (human
   review via diff) or an `output/` copy.
 - Baseline constraints must hold (or be improved) — an already-over-cap skill

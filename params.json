@@ -1,8 +1,8 @@
 {
   "skill_name": "skill-evolution",
   "skill_title": "Skill Self-Improvement — Layer 1 runtime + monitor/triage + Layer 2 offline optimizer for Pi skills",
-  "skill_description": "Two-layer self-improvement for Pi skills: Layer 1 runtime skill_manage extension with per-skill usage telemetry, a session-end triage digest and a prompt suggestion naming the next target, a monitor/triage step that ranks which skill to evolve first, and Layer 2 offline DSPy+GEPA optimization of SKILL.md bodies, constraint-gated, human-reviewed.",
-  "skill_version": "1.5.0",
+  "skill_description": "Two-layer self-improvement for Pi skills: Layer 1 runtime skill_manage extension (patches ungated; a NEW skill needs user approval and must pass skill-forge's lint gate) with per-skill usage telemetry, a session-end triage digest and a prompt suggestion naming the next target, a monitor/triage step that ranks which skill to evolve first, and Layer 2 offline DSPy+GEPA optimization of SKILL.md bodies, constraint-gated, human-reviewed.",
+  "skill_version": "1.6.0",
   "skill_updated": "2026-10-28",
   "skill_triggers": ["evolve a skill", "optimize skill", "layer-2 evolution", "skill evolution", "GEPA", "skill_manage", "which skill should I evolve", "skill usage telemetry", "triage digest"],
   "run_dir": "/home/cheahhl814/claude_workspace/bioinformatics/AIx-BIO/skills/skill-evolution",
@@ -28,6 +28,15 @@
       "companion_doc": "layer1/agents-routing-section.md (copy of the global instruction file §7)",
       "telemetry_schema": "layer1/telemetry-schema.md",
       "telemetry_path": "~/.local/share/skill-evolution/skill-usage.jsonl",
+      "write_policy": {
+        "reference": "references/layer1-write-policy.md",
+        "gated_ops": ["create"],
+        "ungated_ops": ["patch", "write_file", "remove_file", "delete"],
+        "approval": "ctx.ui.confirm — the user approves every new skill; no UI = fail closed; PI_SKILL_MANAGE_ALLOW_CREATE=1 is the unattended opt-out",
+        "conformance": "staged in a temp dir, then linted by skill-forge/bin/skill-lint.py --profile tool-skill --include-vendored --skill-dirs <roots>; any FAIL rejects the batch",
+        "skill_forge_contract": "frontmatter name/description/version/triggers, a README.md in the same batch (write_file op), and `skills: [skill-forge]`",
+        "tests": "tests/test_extension_gate.mjs (13 tests)"
+      },
       "session_end_digest": {
         "trigger": "session_shutdown (skipped on reload)",
         "command": "python -m evolution.monitor.triage --json (stdlib only, no venv needed)",

@@ -13,7 +13,7 @@ tree), the Python package, the git repo, and the home of the Pi extension
 
 | Layer | What | Where | When |
 | --- | --- | --- | --- |
-| **Layer 1** | `skill_manage` tool: create / patch / write_file / remove_file / delete skills atomically, with guardrails (name regex, escape guard, frontmatter contract, 15KB cap, unique-patch match, snapshot+rollback, symlink-aware delete). Injects the skills-first routing prompt; one learning nudge per session; **records per-skill usage telemetry**; **writes a triage digest at session end**; **suggests the ranked next target in the prompt**. | `layer1/extension/skill-memory.ts` | in-session, live |
+| **Layer 1** | `skill_manage` tool: create / patch / write_file / remove_file / delete skills atomically, with guardrails (name regex, escape guard, frontmatter contract, 15KB cap, unique-patch match, snapshot+rollback, symlink-aware delete). Injects the skills-first routing prompt; one learning nudge per session; **records per-skill usage telemetry**; **writes a triage digest at session end**; **suggests the ranked next target in the prompt**. A **new** skill is gated twice: the user approves it, and it must pass skill-forge's lint gate. | `layer1/extension/skill-memory.ts` | in-session, live |
 | **Monitor** | Reads the telemetry, ranks skills by `usage × potential`, prints the next action per skill (`measure` / `evolve` / `shrink` / `stabilize` / `review`). No model calls. | `evolution/monitor/`, `bin/triage` | offline, on demand |
 | **Layer 2** | DSPy + GEPA optimizer over a skill's `SKILL.md` body: eval data from sessions / golden JSONL / synthetic, constraint gates, structural lint gate, human-reviewed local-branch deployment. | `evolution/`, `bin/evolve`, `datasets/`, `tests/` | offline, on demand |
 
@@ -30,6 +30,7 @@ are reviewed and released together.
 | `layer1/telemetry-schema.md` | The telemetry wire contract (JSONL) shared by the TS writer and the Python reader |
 | `layer1/digest-schema.md` | The session-end digest format (what is written, where, and when it is skipped) |
 | `references/monitor-and-digest.md` | Full reference: telemetry weights, triage table, digest format, prompt suggestion, all knobs |
+| `references/layer1-write-policy.md` | Full reference: what `skill_manage` may write — the create approval gate, the skill-forge conformance gate, knobs, failure signatures |
 | `evolution/` | The Python package (config, constraints, dataset builders, fitness, CLI) |
 | `evolution/monitor/` | Telemetry reader + triage ranking (upstream Hermes leaves this a placeholder) |
 | `bin/evolve` | CLI wrapper — the optimizer |
@@ -37,7 +38,7 @@ are reviewed and released together.
 | `bin/smoke-candidate` | Command smoke gate — extracts the skill's shell commands, runs the allowlisted ones, fails the candidate if any of them break |
 | `bin/skill-update-check.py` | Self-update check (git-SHA diff vs origin; no GitHub API) |
 | `datasets/skills/<name>/` | Golden JSONL eval sets (curated; highest signal) |
-| `tests/` | Offline pytest suite — the skill's selftest |
+| `tests/` | Offline pytest suite (Layer 2) + a Node harness for the Layer-1 create gate (`tests/test_extension_gate.mjs`) — the skill's selftest |
 
 ## 🚀 Installation
 
@@ -177,12 +178,26 @@ recomputation.
 
 ## Guardrails (all enforced)
 
-1. Size cap — SKILL.md ≤ 15KB (`PI_EVOLUTION_MAX_SKILL`)
-2. Growth cap — ≤ 1.2x baseline bytes (`PI_EVOLUTION_MAX_GROWTH`)
-3. Frontmatter contract — name + description preserved
-4. skill-forge lint — `python3 skill-lint.py <skill-dir>` exit 0 (if detected)
-5. Optional pytest gate (`--run-tests`)
-6. Human review — deployment is a local branch or an `output/` file; nothing pushed
+**Layer 1 — in-session writes** (`references/layer1-write-policy.md`)
+
+1. **Create needs approval** — `create` asks the user via `ctx.ui.confirm`;
+   declining writes nothing, and a session with no UI fails closed.
+   `PI_SKILL_MANAGE_ALLOW_CREATE=1` is the explicit unattended opt-out.
+2. **Create needs skill-forge conformance** — the candidate is staged in a
+   temp dir and must pass `skill-forge/bin/skill-lint.py --profile tool-skill`
+   before it lands: frontmatter with name/description/version/triggers, a
+   `README.md` shipped in the same batch, and `skill-forge` declared in the
+   frontmatter `skills:` list.
+3. Patching an existing skill is **not** gated — prefer it over creating.
+
+**Layer 2 — offline evolution**
+
+4. Size cap — SKILL.md ≤ 15KB (`PI_EVOLUTION_MAX_SKILL`)
+5. Growth cap — ≤ 1.2x baseline bytes (`PI_EVOLUTION_MAX_GROWTH`)
+6. Frontmatter contract — name + description preserved
+7. skill-forge lint — `python3 skill-lint.py <skill-dir>` exit 0 (if detected)
+8. Optional pytest gate (`--run-tests`)
+9. Human review — deployment is a local branch or an `output/` file; nothing pushed
 
 Anti-bloat: fitness applies a length penalty ramping 0→0.3 past 90% of budget.
 
@@ -227,6 +242,8 @@ copy:
 - Layer 1 writes only inside the skill roots; ops are atomic and
   rollback-able; the live extension is a symlink, so this tree is the only
   copy.
+- A new skill is never written without the user's approval and never without
+  passing skill-forge's lint gate.
 - Nothing pushed; deployment = local `evolve/` branch or `output/` copy.
 - Constraint gates run before anything is written.
 - Human review mandatory.
@@ -235,6 +252,7 @@ copy:
 
 ```bash
 source .venv/bin/activate && python -m pytest tests/ -q
+node tests/test_extension_gate.mjs      # 13 Layer-1 create-gate tests
 node --experimental-strip-types --check layer1/extension/skill-memory.ts
 pi --print --no-session "list your tool names"   # skill_manage present
 ```

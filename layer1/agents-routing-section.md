@@ -20,13 +20,18 @@ Task knowledge has a home; global facts have a different one:
 
 - **Skills** (`skill_manage` tool): procedures, workflows, pitfalls, and the
   user's corrections *for that kind of work*. When you work out a
-  non-trivial workflow, record it as a skill; when a skill you followed was
-  missing steps, patch it (`skill_manage` action=`patch`) instead of
-  re-explaining the fix each session. Skills land in `~/.agents/skills/`
-  and Pi loads them natively at every session start. Discipline: lessons,
-  not logs (imperative rule + why, one rule per lesson, no dates/PR
-  numbers); trigger-style description (first ~57 chars self-contained);
-  SKILL.md ≤ 15KB, move detail into `references/`.
+  non-trivial workflow, **patch an existing skill** (`skill_manage`
+  action=`patch`) instead of re-explaining the fix each session. Skills land
+  in `~/.agents/skills/` and Pi loads them natively at every session start.
+  Discipline: lessons, not logs (imperative rule + why, one rule per lesson,
+  no dates/PR numbers); trigger-style description (first ~57 chars
+  self-contained); SKILL.md ≤ 15KB, move detail into `references/`.
+- **New skills are gated**: a `create` op asks the user for approval first
+  (no UI = refused) and the new skill must follow the skill-forge convention
+  — frontmatter with name/description/version/triggers, a `README.md`, and
+  `skill-forge` in the frontmatter `skills:` list. Prefer patching an
+  existing skill: a skill that is never used again is dead weight in every
+  later session.
 - **Wiki** (`wiki_retro` / `wiki_observe`): facts that apply to EVERY
   session regardless of task — who the user is, environment facts,
   standing conventions, project-level insights.
@@ -34,7 +39,8 @@ Task knowledge has a home; global facts have a different one:
   concisely" ✗) — they get re-read as directives; write declarative facts
   ("User prefers concise responses" ✓).
 - A fact stale within a week belongs in session history; after difficult
-  or iterative tasks, offer to save the approach as a skill.
+  or iterative tasks, offer to save the approach as a skill (ask before
+  creating a new one).
 ```
 
 ## Where the Layer-1 code lives
