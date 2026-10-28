@@ -13,7 +13,8 @@ tree), the Python package, the git repo, and the home of the Pi extension
 
 | Layer | What | Where | When |
 | --- | --- | --- | --- |
-| **Layer 1** | `skill_manage` tool: create / patch / write_file / remove_file / delete skills atomically, with guardrails (name regex, escape guard, frontmatter contract, 15KB cap, unique-patch match, snapshot+rollback, symlink-aware delete). Injects the skills-first routing prompt; one learning nudge per session. | `layer1/extension/skill-memory.ts` | in-session, live |
+| **Layer 1** | `skill_manage` tool: create / patch / write_file / remove_file / delete skills atomically, with guardrails (name regex, escape guard, frontmatter contract, 15KB cap, unique-patch match, snapshot+rollback, symlink-aware delete). Injects the skills-first routing prompt; one learning nudge per session; **records per-skill usage telemetry**. | `layer1/extension/skill-memory.ts` | in-session, live |
+| **Monitor** | Reads the telemetry, ranks skills by `usage × potential`, prints the next action per skill (`measure` / `evolve` / `shrink` / `stabilize` / `review`). No model calls. | `evolution/monitor/`, `bin/triage` | offline, on demand |
 | **Layer 2** | DSPy + GEPA optimizer over a skill's `SKILL.md` body: eval data from sessions / golden JSONL / synthetic, constraint gates, structural lint gate, human-reviewed local-branch deployment. | `evolution/`, `bin/evolve`, `datasets/`, `tests/` | offline, on demand |
 
 Both layers ship from this one repo, so a runtime fix and an optimizer change
@@ -26,8 +27,11 @@ are reviewed and released together.
 | `SKILL.md` | Agent-facing skill contract: procedures, gates, signature library |
 | `layer1/extension/skill-memory.ts` | **Layer 1** — the Pi extension (source of truth; deployed by symlink) |
 | `layer1/agents-routing-section.md` | Copy of the agent's global instruction file's routing section (§7) — keep in sync |
+| `layer1/telemetry-schema.md` | The telemetry wire contract (JSONL) shared by the TS writer and the Python reader |
 | `evolution/` | The Python package (config, constraints, dataset builders, fitness, CLI) |
-| `bin/evolve` | CLI wrapper — the one command to remember |
+| `evolution/monitor/` | Telemetry reader + triage ranking (upstream Hermes leaves this a placeholder) |
+| `bin/evolve` | CLI wrapper — the optimizer |
+| `bin/triage` | CLI wrapper — "which skill should I evolve first?" (read-only, no cost) |
 | `bin/skill-update-check.py` | Self-update check (git-SHA diff vs origin; no GitHub API) |
 | `datasets/skills/<name>/` | Golden JSONL eval sets (curated; highest signal) |
 | `tests/` | Offline pytest suite — the skill's selftest |
@@ -45,6 +49,10 @@ ln -sfn ~/claude_workspace/bioinformatics/AIx-BIO/skills/skill-evolution/layer1/
 ## 💡 Usage
 
 ```bash
+# 0) pick the target — read-only, no model spend
+bin/triage
+bin/triage --json
+
 # validate setup without any API cost — ALWAYS first
 bin/evolve --skill red-pen --eval-source sessions --dry-run
 
@@ -65,6 +73,27 @@ Models via env: `PI_EVOLUTION_OPTIMIZER` (default `openai/gpt-4.1`),
 
 Tier 1 (this repo): SKILL.md bodies. Tier 2/3/4 (tool descriptions, prompt
 sections, code) are future phases, mirroring the upstream Hermes roadmap.
+
+## The monitor / triage step
+
+`bin/triage` implements the piece Hermes upstream never built: Hermes'
+Phase 5 "auto-triage" ranks optimization targets by *(potential improvement ×
+usage frequency)*, but `evolution/monitor/` in
+`hermes-agent-self-evolution` is still a one-line placeholder ("Phase
+placeholder: monitor evolution."). This port fills it in using the signals Pi
+actually has:
+
+- **Usage** — recency-decayed per-skill telemetry written by the Layer-1
+  extension (`skill_loaded` 1.0, `skill_managed` 0.8, `skill_read` 0.6,
+  `skill_failed` 1.5; 14-day half-life).
+- **Potential** — structural payoff estimate: used-but-unmeasured 0.90
+  (`measure`), used-and-over-cap 0.75 (`shrink`), churn ≥3 0.70
+  (`stabilize`), used-and-measured 0.60 (`evolve`), never-used 0.35
+  (`review`).
+- **Priority** — `usage × potential`; the ranking key.
+
+Triage never runs the optimizer, never merges, and never spends tokens. It is
+the input to a *human-gated* `bin/evolve` run, not a replacement for one.
 
 ## How it differs from the Hermes upstream
 

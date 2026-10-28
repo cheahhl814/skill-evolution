@@ -17,6 +17,9 @@
  *   PI_SKILL_MANAGE_MAX_SKILL_BYTES    default 15360
  *   PI_SKILL_MANAGE_NUDGE_MIN_TOOLS    default 6 (0 disables trigger floor)
  *   PI_SKILL_MANAGE_DISABLE_NUDGE      =1 to disable the session-end nudge
+ *   PI_SKILL_TELEMETRY                  =0 to disable per-skill usage telemetry
+ *   PI_SKILL_TELEMETRY_PATH             default ~/.local/share/skill-evolution/skill-usage.jsonl
+ *   PI_SKILL_TELEMETRY_MAX_BYTES       default 5242880 (5MB, rotates to .1)
  */
 
 import * as fs from "node:fs";
@@ -36,6 +39,95 @@ const MAX_SKILL_BYTES = Number(process.env.PI_SKILL_MANAGE_MAX_SKILL_BYTES ?? "1
 const NUDGE_MIN_TOOL_CALLS = Number(process.env.PI_SKILL_MANAGE_NUDGE_MIN_TOOLS ?? "6");
 const NUDGE_ENABLED = process.env.PI_SKILL_MANAGE_DISABLE_NUDGE !== "1";
 const NAME_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/;
+
+// ── per-skill usage telemetry (the Layer-1 signal feed for Layer-2 triage) ─
+//
+// Append-only JSONL. Schema: layer1/telemetry-schema.md (the single contract).
+// Never throws — a telemetry failure must not block the tool call it observes.
+const TELEMETRY_ENABLED = process.env.PI_SKILL_TELEMETRY !== "0";
+const TELEMETRY_PATH =
+	process.env.PI_SKILL_TELEMETRY_PATH ?? path.join(HOME, ".local", "share", "skill-evolution", "skill-usage.jsonl");
+const TELEMETRY_MAX_BYTES = Number(process.env.PI_SKILL_TELEMETRY_MAX_BYTES ?? "5242880");
+const TELEMETRY_SESSION = `s-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+
+type TelemetryEvent = {
+	event: string;
+	skill?: string;
+	op?: string;
+	tool?: string;
+	source?: string;
+	reason?: string;
+};
+
+function record(ev: TelemetryEvent): void {
+	if (!TELEMETRY_ENABLED) return;
+	try {
+		const dir = path.dirname(TELEMETRY_PATH);
+		fs.mkdirSync(dir, { recursive: true });
+		try {
+			const st = fs.statSync(TELEMETRY_PATH);
+			if (st.size > TELEMETRY_MAX_BYTES) fs.renameSync(TELEMETRY_PATH, `${TELEMETRY_PATH}.1`);
+		} catch {
+			/* no file yet */
+		}
+		const line = JSON.stringify({ ts: new Date().toISOString(), session: TELEMETRY_SESSION, ...ev }) + "\n";
+		fs.appendFileSync(TELEMETRY_PATH, line);
+	} catch {
+		/* telemetry is best-effort; never block a tool call */
+	}
+}
+
+/** Skill name from a path that points at a SKILL.md (parent directory name). */
+function skillFromSkillMdPath(p: string): string | undefined {
+	if (!p) return undefined;
+	if (path.basename(p) !== "SKILL.md") return undefined;
+	const name = path.basename(path.dirname(p));
+	return NAME_RE.test(name) ? name : undefined;
+}
+
+/** Skill name from a skill_search load call (name field, or path to a skill dir/SKILL.md). */
+function skillFromLoadInput(input: Record<string, unknown>): string | undefined {
+	const name = typeof input.name === "string" ? input.name.trim() : "";
+	if (name && NAME_RE.test(name)) return name;
+	const p = typeof input.path === "string" ? input.path : "";
+	if (!p) return undefined;
+	return skillFromSkillMdPath(p) ?? (path.basename(p).match(NAME_RE) ? path.basename(p) : undefined);
+}
+
+/** Turn a tool call into telemetry events. */
+function recordToolUsage(toolName: string, rawInput: unknown): void {
+	try {
+		const input = (rawInput ?? {}) as Record<string, unknown>;
+		if (toolName === "skill_search") {
+			const action = typeof input.action === "string" ? input.action : "";
+			if (action !== "load") return;
+			const skill = skillFromLoadInput(input);
+			if (skill) record({ event: "skill_loaded", skill, source: "skill_search" });
+			return;
+		}
+		if (toolName === "read") {
+			const p = typeof input.path === "string" ? input.path : "";
+			const skill = skillFromSkillMdPath(p);
+			if (skill) record({ event: "skill_read", skill, source: "read" });
+			return;
+		}
+		if (toolName === "skill_manage") {
+			const ops = Array.isArray(input.operations) ? (input.operations as Record<string, unknown>[]) : [];
+			for (const op of ops) {
+				const name = typeof op.name === "string" ? op.name : "";
+				const action = typeof op.action === "string" ? op.action : "";
+				if (!name) continue;
+				record({ event: "skill_managed", skill: name, op: action, source: "skill_manage" });
+			}
+			return;
+		}
+		if (/^wiki_(retro|observe)$/.test(toolName)) {
+			record({ event: "learning_tool", tool: toolName, source: "tool" });
+		}
+	} catch {
+		/* never block a tool call */
+	}
+}
 
 // ── path safety (mirrors pi's own "escapes the skills dir" contract) ───────
 
@@ -180,16 +272,27 @@ export default function skillMemoryExtension(pi: ExtensionAPI) {
 	let learningToolUsed = false;
 	let nudgeDelivered = false;
 
-	pi.on("session_start", async () => {
+	pi.on("session_start", async (event) => {
 		toolCallCount = 0;
 		learningToolUsed = false;
 		nudgeDelivered = false;
+		record({ event: "session_start", reason: String((event as { reason?: string })?.reason ?? "") });
 	});
 
 	pi.on("tool_call", (event) => {
 		toolCallCount++;
 		const name = String((event as { toolName?: string; tool?: string }).toolName ?? (event as { tool?: string }).tool ?? "");
 		if (/skill_manage|wiki_retro|wiki_observe/i.test(name)) learningToolUsed = true;
+		recordToolUsage(name, (event as { input?: unknown }).input);
+	});
+
+	pi.on("tool_result", (event) => {
+		const name = String((event as { toolName?: string }).toolName ?? "");
+		if (name !== "skill_manage") return;
+		const details = (event as { details?: { ok?: boolean; error?: string } }).details;
+		if (!details || details.ok !== false) return;
+		const m = /skill '([^']+)'/.exec(details.error ?? "");
+		record({ event: "skill_failed", skill: m?.[1], op: "unknown", source: "skill_manage" });
 	});
 
 	// ── prompt guidance section (Hermes SKILLS_GUIDANCE analog) ───────────

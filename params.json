@@ -1,10 +1,10 @@
 {
   "skill_name": "skill-evolution",
-  "skill_title": "Skill Self-Improvement — Layer 1 runtime + Layer 2 offline optimizer for Pi skills",
-  "skill_description": "Two-layer self-improvement for Pi skills: Layer 1 runtime skill_manage extension + Layer 2 offline DSPy+GEPA optimization of SKILL.md bodies, constraint-gated, human-reviewed.",
-  "skill_version": "1.1.0",
+  "skill_title": "Skill Self-Improvement — Layer 1 runtime + monitor/triage + Layer 2 offline optimizer for Pi skills",
+  "skill_description": "Two-layer self-improvement for Pi skills: Layer 1 runtime skill_manage extension with per-skill usage telemetry, a monitor/triage step that ranks which skill to evolve first, and Layer 2 offline DSPy+GEPA optimization of SKILL.md bodies, constraint-gated, human-reviewed.",
+  "skill_version": "1.2.0",
   "skill_updated": "2026-10-28",
-  "skill_triggers": ["evolve a skill", "optimize skill", "layer-2 evolution", "skill evolution", "GEPA", "skill_manage"],
+  "skill_triggers": ["evolve a skill", "optimize skill", "layer-2 evolution", "skill evolution", "GEPA", "skill_manage", "which skill should I evolve", "skill usage telemetry"],
   "run_dir": "/home/cheahhl814/claude_workspace/bioinformatics/AIx-BIO/skills/skill-evolution",
   "skills_root": "/home/cheahhl814/claude_workspace/bioinformatics/AIx-BIO/skills",
   "github_org": "cheahhl814",
@@ -22,10 +22,18 @@
   "warnings": [],
   "layers": {
     "layer1": {
-      "role": "runtime learning — the skill_manage Pi extension",
+      "role": "runtime learning — the skill_manage Pi extension + per-skill usage telemetry",
       "source": "layer1/extension/skill-memory.ts",
       "deployment": "~/.pi/agent/extensions/skill-memory.ts (symlink into this tree)",
-      "companion_doc": "layer1/agents-routing-section.md (copy of ~/.pi/agent/AGENTS.md §7)"
+      "companion_doc": "layer1/agents-routing-section.md (copy of the global instruction file §7)",
+      "telemetry_schema": "layer1/telemetry-schema.md",
+      "telemetry_path": "~/.local/share/skill-evolution/skill-usage.jsonl"
+    },
+    "monitor": {
+      "role": "triage — rank skills by usage x potential, print the next action",
+      "source": "evolution/monitor/",
+      "entrypoint": "bin/triage",
+      "note": "fills the slot upstream Hermes leaves as a placeholder (Phase 5 auto-triage)"
     },
     "layer2": {
       "role": "offline evolution — DSPy+GEPA optimizer over SKILL.md bodies",

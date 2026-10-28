@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# skill-evolution — triage CLI. Rank skills by evolve-worthiness from Layer-1 telemetry.
+#   bin/triage                # markdown table
+#   bin/triage --json         # machine-readable
+#   bin/triage --only-action measure
+set -euo pipefail
+DIR="$(dirname "$(readlink -f "$0")")"
+ROOT="$(readlink -f "$DIR/..")"
+cd "$ROOT"
+if [ ! -f .venv/bin/activate ]; then
+    echo "venv missing — run: uv venv && uv pip install -e '.[evolution,dev]'" >&2
+    exit 1
+fi
+# shellcheck disable=SC1091
+source .venv/bin/activate
+exec python -m evolution.monitor.triage "$@"
