@@ -12,3 +12,7 @@ preflight.md
 preflight_evidence.txt
 debug-report.md
 tool-inventory.json
+
+# Session handoff artifacts (handoff-skill contract: per-session state, never
+# part of the deliverable — untracked by design)
+handoff*.md
