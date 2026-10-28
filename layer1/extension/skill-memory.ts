@@ -20,11 +20,18 @@
  *   PI_SKILL_TELEMETRY                  =0 to disable per-skill usage telemetry
  *   PI_SKILL_TELEMETRY_PATH             default ~/.local/share/skill-evolution/skill-usage.jsonl
  *   PI_SKILL_TELEMETRY_MAX_BYTES       default 5242880 (5MB, rotates to .1)
+ *   PI_SKILL_TRIAGE_ON_SHUTDOWN         =0 to skip the session-end triage digest
+ *   PI_SKILL_EVOLUTION_ROOT             default ~/.agents/skills/skill-evolution
+ *   PI_SKILL_TRIAGE_DIGEST_DIR          default ~/.local/share/skill-evolution/digests
+ *   PI_SKILL_TRIAGE_TIMEOUT_MS          default 15000
+ *   PI_SKILL_TRIAGE_TOP                 default 10 (rows in the digest table)
+ *   PI_SKILL_TRIAGE_DIGEST_KEEP_DAYS    default 30 (older digest files are pruned)
  */
 
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { spawnSync } from "node:child_process";
 import { StringEnum } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
@@ -129,7 +136,198 @@ function recordToolUsage(toolName: string, rawInput: unknown): void {
 	}
 }
 
-// ── path safety (mirrors pi's own "escapes the skills dir" contract) ───────
+// ── session-end triage digest ──────────────────────────────────────────────
+//
+// On session_shutdown the extension runs the Layer-2 monitor (`bin/triage`,
+// stdlib-only: no venv required) and appends a dated digest section listing
+// which skills are worth evolving. Read-only: triage never runs the optimizer,
+// never merges, never spends tokens. Skipped on `reason: "reload"` so a
+// /reload does not spam the digest directory.
+
+const TRIAGE_ON_SHUTDOWN = process.env.PI_SKILL_TRIAGE_ON_SHUTDOWN !== "0";
+const TRIAGE_TIMEOUT_MS = Number(process.env.PI_SKILL_TRIAGE_TIMEOUT_MS ?? "15000");
+const TRIAGE_TOP = Number(process.env.PI_SKILL_TRIAGE_TOP ?? "10");
+const DIGEST_DIR =
+	process.env.PI_SKILL_TRIAGE_DIGEST_DIR ?? path.join(HOME, ".local", "share", "skill-evolution", "digests");
+const DIGEST_KEEP_DAYS = Number(process.env.PI_SKILL_TRIAGE_DIGEST_KEEP_DAYS ?? "30");
+
+type TriageRow = {
+	skill: string;
+	usage: number;
+	potential: number;
+	priority: number;
+	action: string;
+	reason: string;
+};
+
+/** Locate the skill-evolution checkout (deployed symlink, or an explicit override). */
+function resolveEvolutionRoot(): string | null {
+	const candidates = [
+		process.env.PI_SKILL_EVOLUTION_ROOT,
+		path.join(HOME, ".agents", "skills", "skill-evolution"),
+	].filter((c): c is string => Boolean(c));
+	for (const c of candidates) {
+		try {
+			const root = fs.realpathSync(c);
+			if (fs.existsSync(path.join(root, "evolution", "monitor", "triage.py"))) return root;
+		} catch {
+			/* candidate does not exist */
+		}
+	}
+	return null;
+}
+
+/** Run `python -m evolution.monitor.triage --json`. Returns null on any failure. */
+function runTriage(root: string): TriageRow[] | null {
+	const venvPython = path.join(root, ".venv", "bin", "python");
+	const python = fs.existsSync(venvPython) ? venvPython : "python3";
+	try {
+		const res = spawnSync(
+			python,
+			["-m", "evolution.monitor.triage", "--json"],
+			{
+				cwd: root,
+				env: { ...process.env, PYTHONPATH: root },
+				encoding: "utf8",
+				timeout: TRIAGE_TIMEOUT_MS,
+				maxBuffer: 8 * 1024 * 1024,
+			},
+		);
+		if (res.status !== 0 || !res.stdout) return null;
+		const parsed = JSON.parse(res.stdout);
+		return Array.isArray(parsed) ? (parsed as TriageRow[]) : null;
+	} catch {
+		return null;
+	}
+}
+
+/** Event counts for THIS session, read back from the telemetry file. */
+function sessionEventCounts(): { skills: number; loaded: number; read: number; learning: number } {
+	const counts = { skills: 0, loaded: 0, read: 0, learning: 0 };
+	try {
+		if (!fs.existsSync(TELEMETRY_PATH)) return counts;
+		const lines = fs.readFileSync(TELEMETRY_PATH, "utf8").split("\n");
+		for (const line of lines) {
+			const t = line.trim();
+			if (!t) continue;
+			let obj: { session?: string; event?: string; skill?: string };
+			try {
+				obj = JSON.parse(t);
+			} catch {
+				continue;
+			}
+			if (obj.session !== TELEMETRY_SESSION) continue;
+			if (obj.event === "skill_loaded") {
+				counts.loaded++;
+				counts.skills++;
+			} else if (obj.event === "skill_read") {
+				counts.read++;
+				counts.skills++;
+			} else if (obj.event === "learning_tool") {
+				counts.learning++;
+			}
+		}
+	} catch {
+		/* telemetry is best-effort */
+	}
+	return counts;
+}
+
+type DigestState = { lastTs: string; top: [string, string][] };
+
+function readDigestState(): DigestState | null {
+	try {
+		const p = path.join(DIGEST_DIR, "state.json");
+		if (!fs.existsSync(p)) return null;
+		return JSON.parse(fs.readFileSync(p, "utf8")) as DigestState;
+	} catch {
+		return null;
+	}
+}
+
+function writeDigestState(state: DigestState): void {
+	try {
+		fs.mkdirSync(DIGEST_DIR, { recursive: true });
+		fs.writeFileSync(path.join(DIGEST_DIR, "state.json"), JSON.stringify(state, null, 2));
+	} catch {
+		/* best effort */
+	}
+}
+
+/** Append the digest section, write latest.md, prune old digests. */
+function writeDigest(rows: TriageRow[], counts: { skills: number; loaded: number; read: number; learning: number }, reason: string): void {
+	try {
+		const now = new Date();
+		const stamp = now.toISOString().replace("T", " ").slice(0, 19) + "Z";
+		const day = now.toISOString().slice(0, 10);
+		const top = rows.slice(0, TRIAGE_TOP);
+		const prev = readDigestState();
+		const curTop: [string, string][] = rows.slice(0, 5).map((r) => [r.skill, r.action]);
+		let delta = "first digest";
+		if (prev) {
+			const same =
+				prev.top.length === curTop.length &&
+				prev.top.every(([s, a], i) => s === curTop[i][0] && a === curTop[i][1]);
+			if (same) delta = "unchanged since last digest";
+			else {
+				const changes: string[] = [];
+				for (const [s, a] of curTop) {
+					const before = prev.top.find(([ps]) => ps === s);
+					if (before && before[1] !== a) changes.push(`\`${s}\` ${before[1]} → ${a}`);
+					else if (!before) changes.push(`\`${s}\` new → ${a}`);
+				}
+				delta = changes.length ? changes.join(", ") : "rank reshuffled";
+			}
+		}
+		const leader = top[0];
+		const lines: string[] = [];
+		lines.push(`## ${stamp} — session ${TELEMETRY_SESSION} (shutdown: ${reason})`);
+		lines.push("");
+		lines.push(
+			`- this session: ${counts.skills} skill event(s) (${counts.loaded} loaded, ${counts.read} read), ${counts.learning} learning call(s)`,
+		);
+		lines.push(
+			leader
+				? `- top action: **${leader.action}** → \`${leader.skill}\` (priority ${leader.priority.toFixed(2)})`
+				: "- top action: none — no skills found",
+		);
+		lines.push(`- Δ vs last digest: ${delta}`);
+		lines.push("");
+		lines.push("| # | Skill | Usage | Potential | Priority | Action | Why |");
+		lines.push("| --- | --- | --- | --- | --- | --- | --- |");
+		top.forEach((r, i) => {
+			lines.push(
+				`| ${i + 1} | \`${r.skill}\` | ${r.usage.toFixed(2)} | ${r.potential.toFixed(2)} | ${r.priority.toFixed(2)} | **${r.action}** | ${r.reason} |`,
+			);
+		});
+		lines.push("");
+		const section = lines.join("\n");
+
+		fs.mkdirSync(DIGEST_DIR, { recursive: true });
+		const dayFile = path.join(DIGEST_DIR, `${day}.md`);
+		const header = fs.existsSync(dayFile) ? "" : `# Skill triage digests — ${day}\n\n`;
+		fs.appendFileSync(dayFile, `${header}${section}\n`);
+		fs.writeFileSync(path.join(DIGEST_DIR, "latest.md"), `${section}\n`);
+		writeDigestState({ lastTs: now.toISOString(), top: curTop });
+
+		// prune old digest files
+		if (DIGEST_KEEP_DAYS > 0) {
+			const cutoff = Date.now() - DIGEST_KEEP_DAYS * 86400000;
+			for (const f of fs.readdirSync(DIGEST_DIR)) {
+				if (!f.endsWith(".md") || f === "latest.md") continue;
+				const fp = path.join(DIGEST_DIR, f);
+				try {
+					if (fs.statSync(fp).mtimeMs < cutoff) fs.rmSync(fp);
+				} catch {
+					/* best effort */
+				}
+			}
+		}
+	} catch {
+		/* a digest failure must never break shutdown */
+	}
+}
+
 
 function resolveInsideRoot(name: string, root: string): string | null {
 	if (!fs.existsSync(root)) return null;
@@ -267,10 +465,13 @@ interface OpLog {
 }
 
 export default function skillMemoryExtension(pi: ExtensionAPI) {
-	// ── session-scoped nudge state ────────────────────────────────────────
+	// ── session-scoped state ────────────────────────────────────────────
 	let toolCallCount = 0;
 	let learningToolUsed = false;
 	let nudgeDelivered = false;
+	// session_shutdown can fire more than once for the same session (observed:
+	// a --print run appended its digest section twice) — one digest per session.
+	let digestWritten = false;
 
 	pi.on("session_start", async (event) => {
 		toolCallCount = 0;
@@ -330,6 +531,23 @@ export default function skillMemoryExtension(pi: ExtensionAPI) {
 			{ triggerTurn: true },
 		);
 		if (ctx.hasUI) ctx.ui.notify("skill-memory: learning nudge delivered", "info");
+	});
+
+	// ── session-end triage digest (skip /reload) ──────────────────────────
+	pi.on("session_shutdown", async (event, ctx) => {
+		const reason = String((event as { reason?: string })?.reason ?? "");
+		if (!TRIAGE_ON_SHUTDOWN || reason === "reload" || digestWritten) return;
+		digestWritten = true; // set first: a second fire must not duplicate the section
+		try {
+			const root = resolveEvolutionRoot();
+			if (!root) return;
+			const rows = runTriage(root);
+			if (!rows) return;
+			writeDigest(rows, sessionEventCounts(), reason);
+			if (ctx?.hasUI) ctx.ui.notify("skill-memory: triage digest written", "info");
+		} catch {
+			/* never break shutdown */
+		}
 	});
 
 	// ── skill_manage tool ─────────────────────────────────────────────────

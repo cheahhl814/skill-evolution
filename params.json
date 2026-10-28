@@ -1,10 +1,10 @@
 {
   "skill_name": "skill-evolution",
   "skill_title": "Skill Self-Improvement — Layer 1 runtime + monitor/triage + Layer 2 offline optimizer for Pi skills",
-  "skill_description": "Two-layer self-improvement for Pi skills: Layer 1 runtime skill_manage extension with per-skill usage telemetry, a monitor/triage step that ranks which skill to evolve first, and Layer 2 offline DSPy+GEPA optimization of SKILL.md bodies, constraint-gated, human-reviewed.",
-  "skill_version": "1.2.0",
+  "skill_description": "Two-layer self-improvement for Pi skills: Layer 1 runtime skill_manage extension with per-skill usage telemetry and a session-end triage digest, a monitor/triage step that ranks which skill to evolve first, and Layer 2 offline DSPy+GEPA optimization of SKILL.md bodies, constraint-gated, human-reviewed.",
+  "skill_version": "1.3.0",
   "skill_updated": "2026-10-28",
-  "skill_triggers": ["evolve a skill", "optimize skill", "layer-2 evolution", "skill evolution", "GEPA", "skill_manage", "which skill should I evolve", "skill usage telemetry"],
+  "skill_triggers": ["evolve a skill", "optimize skill", "layer-2 evolution", "skill evolution", "GEPA", "skill_manage", "which skill should I evolve", "skill usage telemetry", "triage digest"],
   "run_dir": "/home/cheahhl814/claude_workspace/bioinformatics/AIx-BIO/skills/skill-evolution",
   "skills_root": "/home/cheahhl814/claude_workspace/bioinformatics/AIx-BIO/skills",
   "github_org": "cheahhl814",
@@ -27,7 +27,14 @@
       "deployment": "~/.pi/agent/extensions/skill-memory.ts (symlink into this tree)",
       "companion_doc": "layer1/agents-routing-section.md (copy of the global instruction file §7)",
       "telemetry_schema": "layer1/telemetry-schema.md",
-      "telemetry_path": "~/.local/share/skill-evolution/skill-usage.jsonl"
+      "telemetry_path": "~/.local/share/skill-evolution/skill-usage.jsonl",
+      "session_end_digest": {
+        "trigger": "session_shutdown (skipped on reload)",
+        "command": "python -m evolution.monitor.triage --json (stdlib only, no venv needed)",
+        "output": "~/.local/share/skill-evolution/digests/ (YYYY-MM-DD.md + latest.md + state.json)",
+        "schema": "layer1/digest-schema.md",
+        "cost": "zero model calls; read-only (never evolves, never merges)"
+      }
     },
     "monitor": {
       "role": "triage — rank skills by usage x potential, print the next action",

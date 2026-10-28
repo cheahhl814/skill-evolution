@@ -1,7 +1,7 @@
 ---
 name: skill-evolution
-description: 'Two-layer skill self-improvement for Pi: Layer 1 runtime (the skill_manage extension that writes and patches skills in-session, plus per-skill usage telemetry) and Layer 2 offline optimizer (DSPy+GEPA over SKILL.md bodies) with a monitor/triage step that ranks which skill to evolve first. Mine session history or golden JSONL into eval data, evolve the skill body under constraint gates (15KB cap, ≤1.2x growth, frontmatter contract, lint gate), and deploy as a local evolve/ branch for human review — never pushes. Use when asked to "optimize/evolve a skill", "improve a SKILL.md offline", "run layer-2", "which skill should I evolve", "pi-skill-evolution", "skill evolution", or about the skill_manage runtime layer. Always dry-run first; ask-user gate before any model spend; report +0.000 outcomes as honest no-ops.'
-version: 1.2.0
+description: 'Two-layer skill self-improvement for Pi: Layer 1 runtime (the skill_manage extension that writes and patches skills in-session, records per-skill usage telemetry, and writes a triage digest at session end) and Layer 2 offline optimizer (DSPy+GEPA over SKILL.md bodies) with a monitor/triage step that ranks which skill to evolve first. Mine session history or golden JSONL into eval data, evolve the skill body under constraint gates (15KB cap, ≤1.2x growth, frontmatter contract, lint gate), and deploy as a local evolve/ branch for human review — never pushes. Use when asked to "optimize/evolve a skill", "improve a SKILL.md offline", "run layer-2", "which skill should I evolve", "triage digest", "pi-skill-evolution", "skill evolution", or about the skill_manage runtime layer. Always dry-run first; ask-user gate before any model spend; report +0.000 outcomes as honest no-ops.'
+version: 1.3.0
 updated: "2026-10-28"
 triggers:
   - "evolve a skill"
@@ -13,6 +13,7 @@ triggers:
   - "runtime skill memory"
   - "which skill should I evolve"
   - "skill usage telemetry"
+  - "triage digest"
 requires:
   - "uv (python env for the vendored .venv)"
   - "A model backend: ollama (cloud or local) or an OpenAI-compatible key"
@@ -69,24 +70,35 @@ The extension is the **write side** of Pi's natively read-only skill system.
 | Prompt injection | `before_agent_start` adds the `skill_memory` section (skills-first routing: task knowledge → skill, cross-session facts → wiki) |
 | Nudge | `agent_before_settle` delivers ONE learning nudge per session (≥ `PI_SKILL_MANAGE_NUDGE_MIN_TOOLS` tool calls, no learning tool used) |
 | Telemetry | Appends per-skill usage events (`skill_loaded` via `skill_search`, `skill_read` via `read` of a `SKILL.md`, `skill_managed` / `skill_failed` via `skill_manage`, `learning_tool`) to a JSONL outside the skill tree — the feed the monitor/triage step consumes. Schema: `layer1/telemetry-schema.md` |
-| Env knobs | `PI_SKILL_MANAGE_ROOTS`, `PI_SKILL_MANAGE_MAX_SKILL_BYTES` (15360), `PI_SKILL_MANAGE_NUDGE_MIN_TOOLS` (6), `PI_SKILL_MANAGE_DISABLE_NUDGE`, `PI_SKILL_TELEMETRY` (0 = off), `PI_SKILL_TELEMETRY_PATH`, `PI_SKILL_TELEMETRY_MAX_BYTES` (5MB) |
+| Session-end digest | On `session_shutdown` the extension runs the monitor (`evolution.monitor.triage --json`, stdlib-only, no venv needed) and appends a dated digest section — ranking, top action, and the delta vs the previous digest. Skipped on `/reload`. See "Session-end digest" below |
+| Env knobs | `PI_SKILL_MANAGE_ROOTS`, `PI_SKILL_MANAGE_MAX_SKILL_BYTES` (15360), `PI_SKILL_MANAGE_NUDGE_MIN_TOOLS` (6), `PI_SKILL_MANAGE_DISABLE_NUDGE`; telemetry + digest knobs in `references/monitor-and-digest.md` §4 |
 
-**Deployment** — the live file is a symlink into this repo, never a copy:
+**Deployment** — the live file is a symlink into this repo, never a copy
+(`ln -sfn <repo>/layer1/extension/skill-memory.ts ~/.pi/agent/extensions/`).
+**Verify after any change**: `node --experimental-strip-types --check
+layer1/extension/skill-memory.ts`, then `pi --print --no-session "list your
+tool names"` — `skill_manage` must be present. Layer-1 code changes go
+through the same review and push as Layer-2 code; no second repo, no second
+copy to drift.
 
-```bash
-ln -sfn ~/claude_workspace/bioinformatics/AIx-BIO/skills/skill-evolution/layer1/extension/skill-memory.ts \
-        ~/.pi/agent/extensions/skill-memory.ts
+## Session-end digest
+
+On `session_shutdown` the extension runs the monitor and appends a digest, so
+every session leaves a record of what is worth evolving next.
+
+```
+~/.local/share/skill-evolution/digests/2026-10-28.md   # one file per UTC day
+~/.local/share/skill-evolution/digests/latest.md        # the newest section
 ```
 
-**Verify after any change** (parse gate, then a live load):
+Each section carries the session's own event counts, the top action, the
+delta vs the previous digest, and the ranked table. The monitor is stdlib-only,
+so this costs **zero** model calls. Skipped on `/reload`; one section per
+session even though `session_shutdown` can fire twice; files older than 30
+days are pruned. Disable with `PI_SKILL_TRIAGE_ON_SHUTDOWN=0`.
 
-```bash
-node --experimental-strip-types --check layer1/extension/skill-memory.ts
-pi --print --no-session "list your tool names"   # skill_manage must be present
-```
-
-Layer-1 code changes go through the same review and push as Layer-2 code;
-there is no second repo and no second copy to drift.
+Format contract and the full knob table: `references/monitor-and-digest.md`
+(§3) and `layer1/digest-schema.md`.
 
 ## Monitor + triage — pick the target before spending tokens
 
@@ -99,18 +111,9 @@ bin/triage --json               # machine-readable
 bin/triage --only-action measure
 ```
 
-```
-| # | Skill                 | Usage | Potential | Priority | Action      | Why |
-| 1 | `read-qc-trimming`    |  6.40 |      0.90 |     5.76 | **measure** | used but has no golden eval set … |
-| 2 | `skill-evolution`     |  2.10 |      0.60 |     1.26 | **evolve**  | used and measured — GEPA candidate |
-```
-
-| Column | Meaning |
-| --- | --- |
-| Usage | recency-decayed telemetry score (14-day half-life): `skill_loaded` 1.0, `skill_managed` 0.8, `skill_read` 0.6, `skill_failed` 1.5 |
-| Potential | estimated payoff of optimizing that skill (see the table below) |
-| Priority | `usage × potential` — the ranking key |
-| Action | what to do next for that skill |
+**priority = usage × potential** — `usage` is the recency-decayed telemetry
+score (14-day half-life: loaded 1.0, managed 0.8, read 0.6, failed 1.5);
+`potential` is the estimated payoff of optimizing that skill:
 
 | Condition | Potential | Action |
 | --- | --- | --- |
@@ -128,6 +131,8 @@ usage frequency"), which upstream still leaves as a placeholder
 
 Triage reads the telemetry file only — no model calls, no cost. Run it before
 `bin/evolve` to choose the target, and again after a run to see the delta.
+Full reference: `references/monitor-and-digest.md`.
+
 
 ## Layer 2 — invocation
 
@@ -187,6 +192,7 @@ bin/evolve --skill <name> --eval-source golden \
 | Layer-1 extension not in the live tool list | `~/.pi/agent/extensions/skill-memory.ts` is a stale copy or a broken symlink | The live file must be a symlink into `layer1/extension/`; fix the link, then `/reload` (or restart) — never keep a second copy |
 | `bin/triage` shows every skill as `review` / usage 0 | No telemetry is being written: the extension predates the telemetry change, or `PI_SKILL_TELEMETRY=0` | `/reload` the extension, then confirm the JSONL exists at `PI_SKILL_TELEMETRY_PATH` (default `~/.local/share/skill-evolution/skill-usage.jsonl`); `skill_loaded` events need a `skill_search(action=load)` call, `skill_read` events need a `read` of a `SKILL.md` |
 | Triage ranks a skill you never touched | The name was parsed from a path, not from a real skill dir | Check the raw events (`cat` the JSONL) — the reader is deliberately dumb about provenance, the writer is strict |
+| The day file has the same digest section twice | `session_shutdown` fired twice for one session | The extension guards with a per-session flag (fixed); if you see it, the extension predates the guard — `/reload` it |
 | Baseline `size_limit: exceeded` (e.g. 25KB) | Target skill genuinely over the 15KB cap | Evolve anyway (shrink is the goal) but expect deploy-gate friction; or set `PI_EVOLUTION_MAX_SKILL` to size the target honestly |
 | Evolved candidate fails `test_smoke.py` despite lint pass | Skill-forge §0.8 lesson: lint is necessary, not sufficient | Gate the candidate, not the delta — run the target skill's own structural tests on the evolve branch before merge-or-drop |
 
@@ -198,9 +204,7 @@ bin/evolve --skill <name> --eval-source golden \
 | `PI_EVOLUTION_EVAL` | `openai/gpt-4.1-mini` | Eval/task model |
 | `PI_EVOLUTION_MAX_SKILL` | 15360 | SKILL.md byte cap |
 | `PI_EVOLUTION_MAX_GROWTH` | 1.2 | Accepted byte growth vs baseline |
-| `PI_SKILL_TELEMETRY` | 1 | `0` disables the Layer-1 telemetry writer |
-| `PI_SKILL_TELEMETRY_PATH` | `~/.local/share/skill-evolution/skill-usage.jsonl` | Telemetry JSONL location (outside the skill tree) |
-| `PI_SKILL_TELEMETRY_MAX_BYTES` | 5242880 | Rotation threshold (renames to `<path>.1`) |
+| `PI_SKILL_TELEMETRY*` / `PI_SKILL_TRIAGE*` | see `references/monitor-and-digest.md` §4 | telemetry writer + session-end digest controls |
 
 ## Hard guarantees
 

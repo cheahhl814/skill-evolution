@@ -13,7 +13,7 @@ tree), the Python package, the git repo, and the home of the Pi extension
 
 | Layer | What | Where | When |
 | --- | --- | --- | --- |
-| **Layer 1** | `skill_manage` tool: create / patch / write_file / remove_file / delete skills atomically, with guardrails (name regex, escape guard, frontmatter contract, 15KB cap, unique-patch match, snapshot+rollback, symlink-aware delete). Injects the skills-first routing prompt; one learning nudge per session; **records per-skill usage telemetry**. | `layer1/extension/skill-memory.ts` | in-session, live |
+| **Layer 1** | `skill_manage` tool: create / patch / write_file / remove_file / delete skills atomically, with guardrails (name regex, escape guard, frontmatter contract, 15KB cap, unique-patch match, snapshot+rollback, symlink-aware delete). Injects the skills-first routing prompt; one learning nudge per session; **records per-skill usage telemetry**; **writes a triage digest at session end**. | `layer1/extension/skill-memory.ts` | in-session, live |
 | **Monitor** | Reads the telemetry, ranks skills by `usage × potential`, prints the next action per skill (`measure` / `evolve` / `shrink` / `stabilize` / `review`). No model calls. | `evolution/monitor/`, `bin/triage` | offline, on demand |
 | **Layer 2** | DSPy + GEPA optimizer over a skill's `SKILL.md` body: eval data from sessions / golden JSONL / synthetic, constraint gates, structural lint gate, human-reviewed local-branch deployment. | `evolution/`, `bin/evolve`, `datasets/`, `tests/` | offline, on demand |
 
@@ -28,6 +28,7 @@ are reviewed and released together.
 | `layer1/extension/skill-memory.ts` | **Layer 1** — the Pi extension (source of truth; deployed by symlink) |
 | `layer1/agents-routing-section.md` | Copy of the agent's global instruction file's routing section (§7) — keep in sync |
 | `layer1/telemetry-schema.md` | The telemetry wire contract (JSONL) shared by the TS writer and the Python reader |
+| `layer1/digest-schema.md` | The session-end digest format (what is written, where, and when it is skipped) |
 | `evolution/` | The Python package (config, constraints, dataset builders, fitness, CLI) |
 | `evolution/monitor/` | Telemetry reader + triage ranking (upstream Hermes leaves this a placeholder) |
 | `bin/evolve` | CLI wrapper — the optimizer |
@@ -94,6 +95,23 @@ actually has:
 
 Triage never runs the optimizer, never merges, and never spends tokens. It is
 the input to a *human-gated* `bin/evolve` run, not a replacement for one.
+
+## Session-end digest (the loop closes itself)
+
+The Layer-1 extension runs the monitor on `session_shutdown` and appends a
+digest, so every session leaves a record of what to evolve next:
+
+```
+~/.local/share/skill-evolution/digests/2026-10-28.md   # one file per UTC day
+~/.local/share/skill-evolution/digests/latest.md        # the newest section
+```
+
+Each section carries the session's own event counts, the top action, the
+delta vs the previous digest, and the ranked table. The monitor is
+stdlib-only, so this costs **zero** model calls. `/reload` is skipped (it
+must not spam the directory), one section is written per session even though
+`session_shutdown` can fire twice, and files older than 30 days are pruned.
+Turn it off with `PI_SKILL_TRIAGE_ON_SHUTDOWN=0`.
 
 ## How it differs from the Hermes upstream
 
