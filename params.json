@@ -1,10 +1,10 @@
 {
   "skill_name": "skill-evolution",
-  "skill_title": "Skill Evolution — offline DSPy+GEPA optimizer for Pi skill bodies",
-  "skill_description": "Layer-2 offline evolution of Pi skill SKILL.md bodies (DSPy+GEPA), constraint-gated, human-reviewed.",
-  "skill_version": "1.0.0",
-  "skill_updated": "2026-10-23",
-  "skill_triggers": ["evolve a skill", "optimize skill", "layer-2 evolution", "skill evolution", "GEPA"],
+  "skill_title": "Skill Self-Improvement — Layer 1 runtime + Layer 2 offline optimizer for Pi skills",
+  "skill_description": "Two-layer self-improvement for Pi skills: Layer 1 runtime skill_manage extension + Layer 2 offline DSPy+GEPA optimization of SKILL.md bodies, constraint-gated, human-reviewed.",
+  "skill_version": "1.1.0",
+  "skill_updated": "2026-10-28",
+  "skill_triggers": ["evolve a skill", "optimize skill", "layer-2 evolution", "skill evolution", "GEPA", "skill_manage"],
   "run_dir": "/home/cheahhl814/claude_workspace/bioinformatics/AIx-BIO/skills/skill-evolution",
   "skills_root": "/home/cheahhl814/claude_workspace/bioinformatics/AIx-BIO/skills",
   "github_org": "cheahhl814",
@@ -19,6 +19,20 @@
   "target_tiers": ["large"],
   "with_nextflow_runner": false,
   "verdict": "GO",
-  "warnings": ["origin remote + GitHub repo not yet created (push pending — created at the push gate)"],
+  "warnings": [],
+  "layers": {
+    "layer1": {
+      "role": "runtime learning — the skill_manage Pi extension",
+      "source": "layer1/extension/skill-memory.ts",
+      "deployment": "~/.pi/agent/extensions/skill-memory.ts (symlink into this tree)",
+      "companion_doc": "layer1/agents-routing-section.md (copy of ~/.pi/agent/AGENTS.md §7)"
+    },
+    "layer2": {
+      "role": "offline evolution — DSPy+GEPA optimizer over SKILL.md bodies",
+      "source": "evolution/",
+      "entrypoint": "bin/evolve",
+      "structural_gate": "skill-forge bin/skill-lint.py (auto-detected)"
+    }
+  },
   "generated": "2026-10-23T14:4x:00+08:00"
 }

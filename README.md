@@ -1,17 +1,31 @@
-# 🧬 skill-evolution — Layer 2 for Pi
+# 🧬 skill-evolution — the two-layer self-improvement skill for Pi
 
 Offline evolutionary optimization of **Pi agent skills** (`SKILL.md` bodies)
 using **DSPy + GEPA** — a port of the Hermes-agent-self-evolution architecture
-to the Pi ecosystem, with guardrails scaled to Pi's deployment conventions.
-Shipped as an AiX-BIO **tool-skill**: this directory is simultaneously the
-skill (`~/.agents/skills/skill-evolution` symlink → this tree), the Python
-package, and the git repo.
+to the Pi ecosystem, with guardrails scaled to Pi's deployment conventions —
+plus the **Layer-1 runtime extension** that writes and patches skills during
+a session. Shipped as an AiX-BIO **tool-skill**: this directory is
+simultaneously the skill (`~/.agents/skills/skill-evolution` symlink → this
+tree), the Python package, the git repo, and the home of the Pi extension
+(`~/.pi/agent/extensions/skill-memory.ts` symlink → `layer1/extension/`).
+
+## The two layers
+
+| Layer | What | Where | When |
+| --- | --- | --- | --- |
+| **Layer 1** | `skill_manage` tool: create / patch / write_file / remove_file / delete skills atomically, with guardrails (name regex, escape guard, frontmatter contract, 15KB cap, unique-patch match, snapshot+rollback, symlink-aware delete). Injects the skills-first routing prompt; one learning nudge per session. | `layer1/extension/skill-memory.ts` | in-session, live |
+| **Layer 2** | DSPy + GEPA optimizer over a skill's `SKILL.md` body: eval data from sessions / golden JSONL / synthetic, constraint gates, structural lint gate, human-reviewed local-branch deployment. | `evolution/`, `bin/evolve`, `datasets/`, `tests/` | offline, on demand |
+
+Both layers ship from this one repo, so a runtime fix and an optimizer change
+are reviewed and released together.
 
 ## Contents
 
 | Path | Role |
 | --- | --- |
 | `SKILL.md` | Agent-facing skill contract: procedures, gates, signature library |
+| `layer1/extension/skill-memory.ts` | **Layer 1** — the Pi extension (source of truth; deployed by symlink) |
+| `layer1/agents-routing-section.md` | Copy of the agent's global instruction file's routing section (§7) — keep in sync |
 | `evolution/` | The Python package (config, constraints, dataset builders, fitness, CLI) |
 | `bin/evolve` | CLI wrapper — the one command to remember |
 | `bin/skill-update-check.py` | Self-update check (git-SHA diff vs origin; no GitHub API) |
@@ -22,6 +36,10 @@ package, and the git repo.
 
 ```bash
 uv venv && uv pip install -e ".[evolution,dev]"
+
+# Layer 1: deploy the extension as a symlink (never a copy)
+ln -sfn ~/claude_workspace/bioinformatics/AIx-BIO/skills/skill-evolution/layer1/extension/skill-memory.ts \
+        ~/.pi/agent/extensions/skill-memory.ts
 ```
 
 ## 💡 Usage
@@ -94,11 +112,21 @@ bin/skill-update-check.py
 
 Single tree at
 `claude_workspace/bioinformatics/AIx-BIO/skills/skill-evolution/` (skill =
-package = repo), exposed to Pi via the `~/.agents/skills` symlink deployment
-(one-way sync per the project's git-tree convention).
+package = repo = extension source), exposed to Pi twice by symlink, never by
+copy:
+
+| Deployment | Symlink |
+| --- | --- |
+| Skill | `~/.agents/skills/skill-evolution` → this tree |
+| Layer-1 extension | `~/.pi/agent/extensions/skill-memory.ts` → `layer1/extension/skill-memory.ts` |
+
+(one-way sync per the project's git-tree convention)
 
 ## 🔒 Hard guarantees
 
+- Layer 1 writes only inside the skill roots; ops are atomic and
+  rollback-able; the live extension is a symlink, so this tree is the only
+  copy.
 - Nothing pushed; deployment = local `evolve/` branch or `output/` copy.
 - Constraint gates run before anything is written.
 - Human review mandatory.
@@ -107,6 +135,8 @@ package = repo), exposed to Pi via the `~/.agents/skills` symlink deployment
 
 ```bash
 source .venv/bin/activate && python -m pytest tests/ -q
+node --experimental-strip-types --check layer1/extension/skill-memory.ts
+pi --print --no-session "list your tool names"   # skill_manage present
 ```
 
 ## Provenance
@@ -114,3 +144,6 @@ source .venv/bin/activate && python -m pytest tests/ -q
 Forged 2026-10-23 from the pre-existing `pi-skill-evolution` repo (relocated
 into the skills tree, history intact) via skill-forge v1.8.0 tool-skill
 profile; preflight verdict GO (`preflight.md`, untracked run artifact).
+Layer 1 (`skill-memory.ts`, previously living only in
+`~/.pi/agent/extensions/`) was folded into this tree on 2026-10-28 so both
+layers are committed and pushed together.

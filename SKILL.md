@@ -1,37 +1,88 @@
 ---
 name: skill-evolution
-description: 'Layer-2 offline optimizer for Pi skill SKILL.md bodies (DSPy+GEPA). Mine session history or golden JSONL into eval data, evolve the skill body under constraint gates (15KB cap, ≤1.2x growth, frontmatter contract, lint gate), and deploy as a local evolve/ branch for human review — never pushes. Use when asked to "optimize/evolve a skill", "improve a SKILL.md offline", "run layer-2", "pi-skill-evolution", or "skill evolution". Always dry-run first; ask-user gate before any model spend; report +0.000 outcomes as honest no-ops.'
-version: 1.0.0
-updated: "2026-10-23"
+description: 'Two-layer skill self-improvement for Pi: Layer 1 runtime (the skill_manage extension that writes and patches skills in-session) and Layer 2 offline optimizer (DSPy+GEPA over SKILL.md bodies). Mine session history or golden JSONL into eval data, evolve the skill body under constraint gates (15KB cap, ≤1.2x growth, frontmatter contract, lint gate), and deploy as a local evolve/ branch for human review — never pushes. Use when asked to "optimize/evolve a skill", "improve a SKILL.md offline", "run layer-2", "pi-skill-evolution", "skill evolution", or about the skill_manage runtime layer. Always dry-run first; ask-user gate before any model spend; report +0.000 outcomes as honest no-ops.'
+version: 1.1.0
+updated: "2026-10-28"
 triggers:
   - "evolve a skill"
   - "optimize skill"
   - "layer-2 evolution"
   - "skill evolution"
   - "pi-skill-evolution"
+  - "skill_manage"
+  - "runtime skill memory"
 requires:
   - "uv (python env for the vendored .venv)"
   - "A model backend: ollama (cloud or local) or an OpenAI-compatible key"
+  - "pi (for the Layer-1 extension; jiti loads the TypeScript source, no build step)"
 ---
 
-# Skill evolution — offline Layer-2 optimizer
+# Skill self-improvement — Layer 1 runtime + Layer 2 offline optimizer
 
 ## What this skill is
 
-A tool-skill wrapper around the **whole Layer-2 tooling vendored in this
-directory**: the `evolution/` package (DSPy+GEPA optimizer over SKILL.md
-bodies), `datasets/` (golden JSONLs), `tests/` (offline pytest), and the two
-entry points `bin/evolve` (CLI wrapper) and the rendered
-`bin/skill-update-check.py`. This directory IS the git repo
-(`github.com/cheahhl814/skill-evolution`) and the deployed skill via the
-`~/.agents/skills/skill-evolution` symlink — one tree, one source of truth.
+**One tree, both layers.** This directory is the Pi skill
+(`~/.agents/skills/skill-evolution` symlink → this tree), the Python package,
+the git repo (`github.com/cheahhl814/skill-evolution`) — and, since
+2026-10-28, also the home of the **Layer-1 runtime extension**. Both halves
+of the self-improvement loop are therefore versioned, reviewed and shipped
+together, and a Layer-1 patch is a Layer-2 evolution target.
 
-Layer 1 (runtime learning — `skill_manage`) handles skill CREATION and PATCHES
-during sessions. This skill is Layer 2: OFFLINE optimization of a skill's
-instruction body with eval data + an evolutionary optimizer, deploying only via
-a local branch you review and merge.
+| Layer | What it is | Where it lives here | When it runs |
+| --- | --- | --- | --- |
+| **Layer 1** | `skill_manage` — writes/patches/deletes skills under guardrails; injects the skills-first routing prompt; one learning nudge per session | `layer1/extension/skill-memory.ts` (deployed as a symlink into `~/.pi/agent/extensions/`) | in-session, live |
+| **Layer 2** | DSPy + GEPA optimizer over a skill's `SKILL.md` body, with eval data, constraint gates and a structural lint gate | `evolution/` package, `bin/evolve`, `datasets/`, `tests/` | offline, on demand |
 
-## Invocation
+Layer 1 handles skill CREATION and PATCHES during a session. Layer 2 is
+OFFLINE optimization of a skill's instruction body with eval data + an
+evolutionary optimizer, deploying only via a local branch you review and
+merge.
+
+## Layout
+
+```
+skill-evolution/                      # = repo = package = deployed skill
+├── SKILL.md                          # this contract
+├── layer1/                           # RUNTIME layer
+│   ├── extension/skill-memory.ts     # the Pi extension (source of truth)
+│   └── agents-routing-section.md     # copy of ~/.pi/agent/AGENTS.md §7
+├── evolution/                        # OFFLINE layer (DSPy+GEPA)
+├── bin/evolve, bin/skill-update-check.py
+├── datasets/skills/<name>/golden.jsonl
+└── tests/
+```
+
+## Layer 1 — runtime (`skill_manage`)
+
+The extension is the **write side** of Pi's natively read-only skill system.
+
+| Capability | Detail |
+| --- | --- |
+| Tool | `skill_manage` — ops `create` / `patch` / `write_file` / `remove_file` / `delete`, applied ATOMICALLY (any failure rolls back every touched skill) |
+| Target root | `~/.agents/skills/` (extra roots via `PI_SKILL_MANAGE_ROOTS`, `:`-separated) |
+| Guardrails | name regex, realpath-escape guard, frontmatter contract (name == target, description required), 15KB cap, patch `old_string` must match exactly once, >5% growth warning, full-tree snapshot + rollback, symlink-aware delete (removes the deployment link, keeps the source tree) |
+| Prompt injection | `before_agent_start` adds the `skill_memory` section (skills-first routing: task knowledge → skill, cross-session facts → wiki) |
+| Nudge | `agent_before_settle` delivers ONE learning nudge per session (≥ `PI_SKILL_MANAGE_NUDGE_MIN_TOOLS` tool calls, no learning tool used) |
+| Env knobs | `PI_SKILL_MANAGE_ROOTS`, `PI_SKILL_MANAGE_MAX_SKILL_BYTES` (15360), `PI_SKILL_MANAGE_NUDGE_MIN_TOOLS` (6), `PI_SKILL_MANAGE_DISABLE_NUDGE` |
+
+**Deployment** — the live file is a symlink into this repo, never a copy:
+
+```bash
+ln -sfn ~/claude_workspace/bioinformatics/AIx-BIO/skills/skill-evolution/layer1/extension/skill-memory.ts \
+        ~/.pi/agent/extensions/skill-memory.ts
+```
+
+**Verify after any change** (parse gate, then a live load):
+
+```bash
+node --experimental-strip-types --check layer1/extension/skill-memory.ts
+pi --print --no-session "list your tool names"   # skill_manage must be present
+```
+
+Layer-1 code changes go through the same review and push as Layer-2 code;
+there is no second repo and no second copy to drift.
+
+## Layer 2 — invocation
 
 ```bash
 # From anywhere:
@@ -86,6 +137,7 @@ bin/evolve --skill <name> --eval-source golden \
 | GEPA rejects `max_steps` kwarg | dspy ≥3.x dropped it for call budgets | Use `max_metric_calls` (CLI already does); metric must accept 5 args |
 | `ModuleNotFoundError: optuna` on MIPROv2 fallback | GEPA path unavailable → MIPROv2 fallback needs optuna | `uv pip install "dspy[optuna]"` in the `.venv` |
 | `update-check` prints `NO-GIT` | Script runs where SKILL.md + `.git` are not siblings | Run inside this repo root (skill source tree), or check the symlink resolves here |
+| Layer-1 extension not in the live tool list | `~/.pi/agent/extensions/skill-memory.ts` is a stale copy or a broken symlink | The live file must be a symlink into `layer1/extension/`; fix the link, then `/reload` (or restart) — never keep a second copy |
 | Baseline `size_limit: exceeded` (e.g. 25KB) | Target skill genuinely over the 15KB cap | Evolve anyway (shrink is the goal) but expect deploy-gate friction; or set `PI_EVOLUTION_MAX_SKILL` to size the target honestly |
 | Evolved candidate fails `test_smoke.py` despite lint pass | Skill-forge §0.8 lesson: lint is necessary, not sufficient | Gate the candidate, not the delta — run the target skill's own structural tests on the evolve branch before merge-or-drop |
 
@@ -100,6 +152,9 @@ bin/evolve --skill <name> --eval-source golden \
 
 ## Hard guarantees
 
+- Layer 1 never writes outside the skill roots; every op is atomic and
+  rollback-able, and the live extension is a symlink into this repo — this
+  tree is the single source of truth for both layers.
 - Nothing is ever pushed. Deployment = local branch in this repo (human
   review via diff) or an `output/` copy.
 - Baseline constraints must hold (or be improved) — an already-over-cap skill
