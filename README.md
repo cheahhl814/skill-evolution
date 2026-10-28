@@ -97,6 +97,11 @@ actually has:
 Triage never runs the optimizer, never merges, and never spends tokens. It is
 the input to a *human-gated* `bin/evolve` run, not a replacement for one.
 
+The first measured target is **`ncal`**: its 21-example golden set lives in
+`datasets/skills/ncal/golden.jsonl`, and adding it flipped the triage action
+from `measure` to `evolve` — the visible proof that the ranking reacts to
+real state rather than to a guess.
+
 ## Session-end digest (the loop closes itself)
 
 The Layer-1 extension runs the monitor on `session_shutdown` and appends a
