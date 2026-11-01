@@ -32,7 +32,11 @@ from rich.table import Table
 from evolution.core.config import EvolutionConfig, find_git_repo_root, resolve_skill
 from evolution.core.dataset_builder import GoldenDatasetLoader, build_dataset_from_pi_sessions  # noqa: F401
 from evolution.core.constraints import ConstraintValidator
-from evolution.core.fitness import gepa_feedback_metric, skill_fitness_metric  # noqa: F401
+from evolution.core.fitness import (
+    gepa_feedback_metric,
+    make_judge_metrics,
+    skill_fitness_metric,
+)  # noqa: F401
 from evolution.skills.skill_module import (
     extract_skill_text,
     load_skill,
@@ -103,8 +107,12 @@ def deploy(skill_name: str, skill: dict, evolved_full: str, output_dir: Path) ->
 @click.option("--hermes-repo", default=None, hidden=True)
 @click.option("--run-tests", is_flag=True, help="Run the skill source tree's pytest as a hard gate")
 @click.option("--dry-run", is_flag=True, help="Validate setup (find, load, constraints, dataset heuristic count) without API calls")
+@click.option("--metric", "metric_kind", default="judge", type=click.Choice(["judge", "proxy"]),
+              help="Fitness metric. 'judge' (default) scores with the LLMJudge rubric — the "
+                   "keyword-overlap proxy is proven gameable (ncal 2026-10-28 false positive). "
+                   "'proxy' is the cheap 0.3+0.7*overlap heuristic, opt-in for experiments only")
 @click.option("--smoke", is_flag=True, help="Run the command smoke gate on the candidate (bin/smoke-candidate): a candidate whose commands do not run is rejected before deploy")
-def main(skill, iterations, eval_source, dataset_path, hermes_repo, run_tests, dry_run, smoke):
+def main(skill, iterations, eval_source, dataset_path, hermes_repo, run_tests, dry_run, smoke, metric_kind):
     config = EvolutionConfig()
     skill_path = resolve_skill(skill, config)
     if not skill_path:
@@ -154,13 +162,29 @@ def main(skill, iterations, eval_source, dataset_path, hermes_repo, run_tests, d
     dspy.configure(lm=lm)
     baseline_module = make_skill_module(found["body"])
 
+    # Fitness metric: LLMJudge rubric scoring by default (the keyword-overlap
+    # proxy was gamed by a grounding ritual on the ncal run and got a false
+    # positive deployed as a candidate — see output/ncal/VERDICT.md).
+    score_metric = feedback_metric = None
+    if metric_kind == "judge":
+        from evolution.core.fitness import LLMJudge
+
+        judge = LLMJudge(config, eval_model=config.eval_model)
+        score_metric, feedback_metric = make_judge_metrics(
+            judge, skill_text=found["body"], max_size=config.max_skill)
+        console.print("  metric: LLMJudge rubric (correctness/procedure/conciseness − length penalty)")
+    else:
+        console.print("[yellow]  metric: keyword-overlap proxy — GAMEABLE, treat any positive delta "
+                      "as unverified until manually re-scored (see signature library)[/yellow]")
+        score_metric, feedback_metric = skill_fitness_metric, gepa_feedback_metric
+
     console.print(f"\n[bold cyan]Running GEPA ({iterations} iterations)...[/bold cyan]")
     try:
         # dspy >=3.x: GEPA uses call budgets (max_metric_calls) and a 5-arg
         # feedback metric ({'score','feedback'}); MIPROv2 fallback keeps the
         # plain-float metric.
         optimizer = dspy.GEPA(
-            metric=gepa_feedback_metric,
+            metric=feedback_metric,
             max_metric_calls=iterations * 10,
             reflection_lm=dspy.LM(config.optimizer_model),
             num_threads=4,
@@ -168,7 +192,7 @@ def main(skill, iterations, eval_source, dataset_path, hermes_repo, run_tests, d
         optimized = optimizer.compile(baseline_module, trainset=dataset.to_dspy_examples("train"), valset=dataset.to_dspy_examples("val"))
     except Exception as e:
         console.print(f"[yellow]GEPA unavailable ({e}); falling back to MIPROv2[/yellow]")
-        optimizer = dspy.MIPROv2(metric=skill_fitness_metric, auto="light")
+        optimizer = dspy.MIPROv2(metric=score_metric, auto="light")
         optimized = optimizer.compile(baseline_module, trainset=dataset.to_dspy_examples("train"))
 
     evolved_body = extract_skill_text(optimized)
@@ -188,9 +212,18 @@ def main(skill, iterations, eval_source, dataset_path, hermes_repo, run_tests, d
 
     console.print("[bold]Holdout evaluation (baseline vs evolved)[/bold]")
     base_scores, evo_scores = [], []
-    for ex in dataset.to_dspy_examples("holdout"):
-        base_scores.append(skill_fitness_metric(ex, baseline_module(task_input=ex.task_input)))
-        evo_scores.append(skill_fitness_metric(ex, optimized(task_input=ex.task_input)))
+    if metric_kind == "judge":
+        # The judge scores each variant against ITS OWN instructions — the
+        # evolved body is the candidate, not the baseline text.
+        _, evo_feedback = make_judge_metrics(
+            judge, skill_text=evolved_body, max_size=config.max_skill)
+        for ex in dataset.to_dspy_examples("holdout"):
+            base_scores.append(score_metric(ex, baseline_module(task_input=ex.task_input)))
+            evo_scores.append(evo_feedback(ex, optimized(task_input=ex.task_input)))
+    else:
+        for ex in dataset.to_dspy_examples("holdout"):
+            base_scores.append(skill_fitness_metric(ex, baseline_module(task_input=ex.task_input)))
+            evo_scores.append(skill_fitness_metric(ex, optimized(task_input=ex.task_input)))
     avg_base = sum(base_scores) / max(1, len(base_scores))
     avg_evo = sum(evo_scores) / max(1, len(evo_scores))
 
@@ -200,6 +233,7 @@ def main(skill, iterations, eval_source, dataset_path, hermes_repo, run_tests, d
     (out_dir / "baseline_skill.md").write_text(found["raw"])
     (out_dir / "metrics.json").write_text(json.dumps({
         "skill": skill, "timestamp": ts, "iterations": iterations, "eval_source": eval_source,
+        "metric": metric_kind,
         "baseline_score": avg_base, "evolved_score": avg_evo, "improvement": avg_evo - avg_base,
         "baseline_bytes": len(found["body"].encode()), "evolved_bytes": len(evolved_body.encode()),
         "constraints_passed": all_pass, "elapsed_seconds": round(time.time() - start, 1),
@@ -210,7 +244,7 @@ def main(skill, iterations, eval_source, dataset_path, hermes_repo, run_tests, d
         table.add_column(col, justify="right")
     delta = avg_evo - avg_base
     change = f"[green]{delta:+.3f}[/green]" if delta >= 0 else f"[red]{delta:+.3f}[/red]"
-    table.add_row("Holdout score", f"{avg_base:.3f}", f"{avg_evo:.3f}", change)
+    table.add_row(f"Holdout score ({metric_kind})", f"{avg_base:.3f}", f"{avg_evo:.3f}", change)
     table.add_row("Body bytes", str(len(found['body'].encode())), str(len(evolved_body.encode())), f"{len(evolved_body.encode()) - len(found['body'].encode()):+}")
     console.print(table)
     if delta <= 0:

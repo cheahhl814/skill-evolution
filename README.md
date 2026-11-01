@@ -211,10 +211,14 @@ Anti-bloat: fitness applies a length penalty ramping 0→0.3 past 90% of budget.
 
 ## Design notes
 
-- The GEPA metric is a fast keyword-overlap proxy (matches upstream's shipped
-  trade-off): affordable during search; holdout deltas are reported separately
-  and the LLM rubric judge (`evolution.core.fitness.LLMJudge`) is available for
-  final candidate scoring.
+- **The GEPA metric is the LLMJudge rubric by default** (`--metric judge`, wired via
+  `evolution.core.fitness.make_judge_metrics`): correctness 0.5 / procedure 0.3 /
+  conciseness 0.2 − length penalty, scored against the ACTIVE candidate's
+  instructions (extracted from the DSPy trace) with per-triple memoisation.
+  The old keyword-overlap proxy (`--metric proxy`) is opt-in for cheap
+  experiments only — it was proven gameable on the 2026-10-28 ncal run
+  (a grounding ritual scored +0.096 while being worse). The judge applies a
+  length penalty inside `.score`, so the metric factory trusts it there.
 - Deployment edits the skill through its deployment symlink, so git branches
   live in the source tree this repo already tracks — local evolution commits
   show as drift vs origin until merged and pushed (correct signal, not a bug).

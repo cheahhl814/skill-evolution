@@ -101,6 +101,13 @@ def skill_fitness_metric(example, prediction, trace=None, pred_name=None, pred_t
     holdout with LLMJudge before any deployment. NOTE: this mirrors the
     Hermes implementation's shipped trade-off.
 
+    GAMING WARNING (observed on the 2026-10-28 ncal run): this proxy is
+    gameable — `0.3 + 0.7 * overlap` rewards fixed opening sentences that
+    parrot the rubric and deletes of worked examples. It is kept ONLY as the
+    `--metric proxy` opt-in for cheap experiments. The default Layer-2 metric
+    is `make_judge_metrics(...)` in this module, which scores with the
+    LLMJudge rubric instead.
+
     5-arg signature (gold, pred, trace, pred_name, pred_trace) is required by
     dspy >=3.4 GEPA's bind(None, None, None, None, None) validation; MIPROv2
     still calls it positionally as (gold, pred, trace) and needs a plain float.
@@ -142,3 +149,117 @@ def gepa_feedback_metric(example, prediction, trace=None, pred_name=None, pred_t
         f"missing elements; keep instructions concrete, imperative, one rule per lesson."
     )
     return {"score": score, "feedback": feedback}
+
+
+def _instructions_from_trace(trace) -> Optional[str]:
+    """Best-effort extraction of the ACTIVE candidate's skill instructions from
+    a DSPy metric trace. GEPA mutates the predictor instruction (each candidate
+    *is* a proposed skill body), so judge must score procedure-following
+    against the candidate's own text, not the frozen baseline. Falls back to
+    None when no trace carries a signature (callers then use the baseline)."""
+    from evolution.skills.skill_module import _SKILL_FOOTER
+
+    try:
+        for item in trace or []:
+            if not isinstance(item, (tuple, list)) or not item:
+                continue
+            holder = item[0]
+            sig = getattr(holder, "signature", None)
+            if sig is None:
+                for attr in ("predictor", "predict"):
+                    inner = getattr(holder, attr, None)
+                    if inner is None:
+                        continue
+                    if getattr(inner, "instructions", None):
+                        sig = inner  # the inner object IS the signature
+                        break
+                    sig = getattr(inner, "signature", None)
+                    if sig is not None:
+                        break
+            instructions = getattr(sig, "instructions", None)
+            if instructions:
+                # Strip the module footer so the judged text is the bare
+                # candidate body (matches extract_skill_text semantics).
+                if instructions.endswith(_SKILL_FOOTER):
+                    return instructions[: -len(_SKILL_FOOTER)].strip()
+                return instructions.strip()
+    except Exception:
+        return None
+    return None
+
+
+def make_judge_metrics(judge, skill_text: str, artifact_size: Optional[int] = None,
+                       max_size: Optional[int] = None):
+    """Build the DEFAULT Layer-2 metrics: LLMJudge rubric scoring instead of the
+    gameable keyword-overlap proxy.
+
+    `judge` is anything with `.score(task_input, expected_behavior,
+    agent_output, skill_text, artifact_size, max_size) -> FitnessScore` —
+    normally an `LLMJudge`, but any offline stub satisfying the protocol works
+    (this is what the tests inject to stay free).
+
+    When DSPy supplies a metric trace carrying the predictor's instructions,
+    the judge scores against the ACTIVE candidate's instructions (each GEPA
+    candidate IS a proposed skill body); without a trace the baseline
+    `skill_text` is used.
+
+    Returns (feedback_metric, score_metric):
+    - feedback_metric: 5-arg DSPy metric for GEPA — program level returns a
+      plain float composite; predictor level returns {'score', 'feedback'}
+      with the judge's actionable feedback so the reflection LM rewrites the
+      skill toward the missed rubric elements.
+    - score_metric: plain-float composite, used by the MIPROv2 fallback and
+      for holdout scoring.
+
+    Identical (task_input, agent_output, judged_skill_text) triples are
+    memoised — GEPA re-evaluates unchanged candidates and each judge call is
+    a paid one.
+    """
+    import hashlib
+
+    cache: dict = {}
+    base_size = len(skill_text.encode()) if artifact_size is None else artifact_size
+
+    def _score(example, prediction, trace=None) -> FitnessScore:
+        agent_output = (getattr(prediction, "output", "") or "").strip()
+        judged_text = _instructions_from_trace(trace) or skill_text
+        size = len(judged_text.encode()) if judged_text is not skill_text else base_size
+        key = hashlib.sha1(
+            "\x00".join([
+                str(getattr(example, "task_input", "")),
+                agent_output,
+                judged_text,
+            ]).encode()
+        ).hexdigest()
+        if key not in cache:
+            if not agent_output:
+                cache[key] = FitnessScore(
+                    feedback="The agent produced no output. The skill instructions "
+                            "left no actionable path to follow — make the next step "
+                            "explicit.")
+            else:
+                cache[key] = judge.score(
+                    task_input=str(getattr(example, "task_input", "")),
+                    expected_behavior=str(getattr(example, "expected_behavior", "")),
+                    agent_output=agent_output,
+                    skill_text=judged_text,
+                    artifact_size=size,
+                    max_size=max_size,
+                )
+        return cache[key]
+
+    def score_metric(example, prediction, trace=None, pred_name=None, pred_trace=None) -> float:
+        """Plain-float composite (MIPROv2 fallback + holdout scoring)."""
+        return _score(example, prediction, trace).composite
+
+    def feedback_metric(example, prediction, trace=None, pred_name=None, pred_trace=None):
+        """GEPA feedback metric (dspy >=3.4 contract, 5-arg): program level →
+        float, predictor level → {'score','feedback'} from the judge."""
+        fs = _score(example, prediction, trace)
+        if pred_name is None:
+            return fs.composite
+        return {"score": fs.composite, "feedback": fs.feedback or
+                "No judge feedback; keep the skill instructions concrete and "
+                "verifiable."}
+
+    return score_metric, feedback_metric
