@@ -76,6 +76,32 @@ bin/evolve --skill <name> --eval-source golden \
     --dataset-path datasets/skills/<name>/golden.jsonl --smoke
 ```
 
+## 8. Verify the candidate (`--verify`)
+
+GEPA's judge and the optimizer can share a model family (default both are
+`openai/*`). The optimizer then learns to please the judge's blind spots
+— the ncal 2026-10-28 ritual is one instance. The verifier is a post-GEPA,
+veto-only gate on a **different family** that catches shared-bias gaming.
+
+| Mode | Behaviour |
+| --- | --- |
+| `--verify auto` (default) | Run the gate when `PI_EVOLUTION_VERIFIER` is set; otherwise mark `UNVERIFIED` and deploy normally |
+| `--verify on` | Require `PASS`; `FAIL`/`INCONCLUSIVE`/`UNAVAILABLE` vetoes the deploy (no branch) |
+| `--verify off` | Skip the gate entirely |
+
+The verifier sees only `task + rubric + anonymised A/B outputs` in both
+orders; a verdict counts only if both orders agree (absorbs position bias).
+It never sees the skill text or the diff — isolation is enforced by the
+function signature. A deterministic ritual detector (4–6-gram overlap with
+rubric text) runs first and can veto without any model call.
+
+Env: `PI_EVOLUTION_VERIFIER` (e.g. `anthropic/claude-sonnet-5-5`), and
+`PI_EVOLUTION_JUDGE` (split from `PI_EVOLUTION_EVAL`; default falls back for
+backwards compat). Diversity is checked at startup including `--dry-run`;
+unknown families are refused unless `--verifier-family-override` is given.
+The ledger `output/verifier-ledger.jsonl` accumulates judge/verifier/human
+agreement for later audit.
+
 ## The fitness metric is the next bottleneck
 
 The keyword-overlap proxy is affordable during search but gameable. The

@@ -44,6 +44,10 @@ class LLMJudge:
     """Rubric-based judge. scores + actionable feedback for GEPA reflection."""
 
     def __init__(self, config, eval_model: Optional[str] = None):
+        # Prefer dedicated judge_model when present; eval_model param is
+        # kept for backwards compat but judge_model is the intended source.
+        if eval_model is None:
+            eval_model = getattr(config, "judge_model", None) or getattr(config, "eval_model", None)
         import dspy
 
         class _Judge(dspy.Signature):

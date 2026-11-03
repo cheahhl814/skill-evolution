@@ -13,7 +13,7 @@ Pipeline (Hermes self-evolution discipline, ported to Pi):
       otherwise                       → output/<skill>/evolved_skill.md + copy instructions
   Human review is ALWAYS required; nothing is pushed or applied directly.
 
-Env: PI_EVOLUTION_OPTIMIZER / PI_EVOLUTION_EVAL (DSPy LM strings),
+Env: PI_EVOLUTION_OPTIMIZER / PI_EVOLUTION_EVAL / PI_EVOLUTION_JUDGE / PI_EVOLUTION_VERIFIER (DSPy LM strings),
      SKILL_FORGE_LINT (optional structural gate; auto-detected).
 """
 
@@ -29,7 +29,7 @@ import click
 from rich.console import Console
 from rich.table import Table
 
-from evolution.core.config import EvolutionConfig, find_git_repo_root, resolve_skill
+from evolution.core.config import EvolutionConfig, check_family_diversity, find_git_repo_root, resolve_skill
 from evolution.core.dataset_builder import GoldenDatasetLoader, build_dataset_from_pi_sessions  # noqa: F401
 from evolution.core.constraints import ConstraintValidator
 from evolution.core.fitness import (
@@ -112,8 +112,13 @@ def deploy(skill_name: str, skill: dict, evolved_full: str, output_dir: Path) ->
                    "keyword-overlap proxy is proven gameable (ncal 2026-10-28 false positive). "
                    "'proxy' is the cheap 0.3+0.7*overlap heuristic, opt-in for experiments only")
 @click.option("--smoke", is_flag=True, help="Run the command smoke gate on the candidate (bin/smoke-candidate): a candidate whose commands do not run is rejected before deploy")
-def main(skill, iterations, eval_source, dataset_path, hermes_repo, run_tests, dry_run, smoke, metric_kind):
+@click.option("--verify", default="auto", type=click.Choice(["auto", "on", "off"]),
+              help="Verifier gate: auto (run when PI_EVOLUTION_VERIFIER is set, else skip as UNVERIFIED), on (require verifier, fail if unavailable), off (skip)")
+@click.option("--verifier-family-override", default=None,
+              help="Override verifier family detection for unknown model names (e.g. beam/big/flint)")
+def main(skill, iterations, eval_source, dataset_path, hermes_repo, run_tests, dry_run, smoke, metric_kind, verify, verifier_family_override):
     config = EvolutionConfig()
+    check_family_diversity(config, verifier_family_override=verifier_family_override)
     skill_path = resolve_skill(skill, config)
     if not skill_path:
         console.print(f"[red]✗ skill '{skill}' not found in: {[str(p) for p in config.skills_roots]}[/red]")
@@ -144,7 +149,7 @@ def main(skill, iterations, eval_source, dataset_path, hermes_repo, run_tests, d
                 console.print(f"  • [{p.timestamp[:10]}] {p.user_text[:90]}...")
         else:
             console.print("\n[bold]Dry run[/bold]: setup validated; synthetic generation / GEPA would run on the configured models:")
-            console.print(f"  optimizer: {config.optimizer_model} | eval: {config.eval_model}")
+            console.print(f"  optimizer: {config.optimizer_model} | eval: {config.eval_model} | judge: {config.judge_model} | verifier: {config.verifier_model or '(off)'}")
         console.print(f"  lint gate: {config.skillforge_lint or '(not configured)'}")
         console.print(f"  deployment: git branch if the skill's source tree is a repo — {find_git_repo_root(skill_path.resolve()) or 'output/ copy'}")
         console.print("[green]✓ dry run complete — nothing was modified[/green]")
@@ -171,7 +176,7 @@ def main(skill, iterations, eval_source, dataset_path, hermes_repo, run_tests, d
 
         judge = LLMJudge(config, eval_model=config.eval_model)
         score_metric, feedback_metric = make_judge_metrics(
-            judge, skill_text=found["body"], max_size=config.max_skill)
+            judge, skill_text=found["body"], max_size=config.max_skill_size)
         console.print("  metric: LLMJudge rubric (correctness/procedure/conciseness − length penalty)")
     else:
         console.print("[yellow]  metric: keyword-overlap proxy — GAMEABLE, treat any positive delta "
@@ -198,6 +203,28 @@ def main(skill, iterations, eval_source, dataset_path, hermes_repo, run_tests, d
     evolved_body = extract_skill_text(optimized)
     evolved_full = reassemble_skill(found["frontmatter"], evolved_body)
 
+    # Deterministic no-op short-circuit: identical bytes can still show a
+    # small positive delta from temperature>0 on both arms; treat as no-op
+    # without calling any further gates.
+    is_noop = evolved_body.strip() == found["body"].strip()
+    if is_noop:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        out_dir = Path("output") / skill / ts
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / "baseline_skill.md").write_text(found["raw"])
+        (out_dir / "evolved_skill.md").write_text(evolved_full)
+        (out_dir / "metrics.json").write_text(json.dumps({
+            "skill": skill, "timestamp": ts, "iterations": iterations, "eval_source": eval_source,
+            "metric": metric_kind,
+            "baseline_score": None, "evolved_score": None, "improvement": 0.0,
+            "baseline_bytes": len(found["body"].encode()), "evolved_bytes": len(evolved_body.encode()),
+            "constraints_passed": True, "elapsed_seconds": round(time.time() - start, 1),
+            "noop": True,
+        }, indent=2))
+        console.print("[yellow]⚠ no-op: evolved body identical to baseline — nothing deployed[/yellow]")
+        console.print(f"  diff: diff {out_dir / 'baseline_skill.md'} {out_dir / 'evolved_skill.md'} (no changes)")
+        return
+
     console.print("[bold]Evolved constraints[/bold]")
     all_pass = True
     for c in validator.validate_all(evolved_full, baseline_text=found["raw"]):
@@ -211,19 +238,36 @@ def main(skill, iterations, eval_source, dataset_path, hermes_repo, run_tests, d
         raise SystemExit(1)
 
     console.print("[bold]Holdout evaluation (baseline vs evolved)[/bold]")
+    holdout_examples = dataset.to_dspy_examples("holdout")
+    holdout_tasks: list[str] = []
+    holdout_rubrics: list[str] = []
+    baseline_outputs: list[str] = []
+    candidate_outputs: list[str] = []
     base_scores, evo_scores = [], []
     if metric_kind == "judge":
         # The judge scores each variant against ITS OWN instructions — the
         # evolved body is the candidate, not the baseline text.
         _, evo_feedback = make_judge_metrics(
-            judge, skill_text=evolved_body, max_size=config.max_skill)
-        for ex in dataset.to_dspy_examples("holdout"):
-            base_scores.append(score_metric(ex, baseline_module(task_input=ex.task_input)))
-            evo_scores.append(evo_feedback(ex, optimized(task_input=ex.task_input)))
+            judge, skill_text=evolved_body, max_size=config.max_skill_size)
+        for ex in holdout_examples:
+            base_pred = baseline_module(task_input=ex.task_input)
+            cand_pred = optimized(task_input=ex.task_input)
+            holdout_tasks.append(str(ex.task_input))
+            holdout_rubrics.append(str(ex.expected_behavior))
+            baseline_outputs.append(getattr(base_pred, "output", "") or "")
+            candidate_outputs.append(getattr(cand_pred, "output", "") or "")
+            base_scores.append(score_metric(ex, base_pred))
+            evo_scores.append(evo_feedback(ex, cand_pred))
     else:
-        for ex in dataset.to_dspy_examples("holdout"):
-            base_scores.append(skill_fitness_metric(ex, baseline_module(task_input=ex.task_input)))
-            evo_scores.append(skill_fitness_metric(ex, optimized(task_input=ex.task_input)))
+        for ex in holdout_examples:
+            base_pred = baseline_module(task_input=ex.task_input)
+            cand_pred = optimized(task_input=ex.task_input)
+            holdout_tasks.append(str(ex.task_input))
+            holdout_rubrics.append(str(ex.expected_behavior))
+            baseline_outputs.append(getattr(base_pred, "output", "") or "")
+            candidate_outputs.append(getattr(cand_pred, "output", "") or "")
+            base_scores.append(skill_fitness_metric(ex, base_pred))
+            evo_scores.append(skill_fitness_metric(ex, cand_pred))
     avg_base = sum(base_scores) / max(1, len(base_scores))
     avg_evo = sum(evo_scores) / max(1, len(evo_scores))
 
@@ -231,13 +275,14 @@ def main(skill, iterations, eval_source, dataset_path, hermes_repo, run_tests, d
     out_dir = Path("output") / skill / ts
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "baseline_skill.md").write_text(found["raw"])
-    (out_dir / "metrics.json").write_text(json.dumps({
+    metrics_payload = {
         "skill": skill, "timestamp": ts, "iterations": iterations, "eval_source": eval_source,
         "metric": metric_kind,
         "baseline_score": avg_base, "evolved_score": avg_evo, "improvement": avg_evo - avg_base,
         "baseline_bytes": len(found["body"].encode()), "evolved_bytes": len(evolved_body.encode()),
         "constraints_passed": all_pass, "elapsed_seconds": round(time.time() - start, 1),
-    }, indent=2))
+    }
+    (out_dir / "metrics.json").write_text(json.dumps(metrics_payload, indent=2))
 
     table = Table(title="Evolution results")
     for col in ("Metric", "Baseline", "Evolved", "Change"):
@@ -288,6 +333,62 @@ def main(skill, iterations, eval_source, dataset_path, hermes_repo, run_tests, d
             console.print(f"[green]✓ smoke gate: {report.get('total', 0)} command(s) checked, all ran[/green]")
         else:
             console.print("[yellow]⚠ smoke gate requested but bin/smoke-candidate is missing — skipped[/yellow]")
+
+    # ── verifier gate (post-GEPA, veto-only, different-family) ────────────
+    # Order: deterministic gates first (no-op already handled), then paid
+    # verifier last — scales with holdout H not GEPA budget. UNVERIFIED
+    # never silently PASSes.
+    should_verify = (verify == "on") or (verify == "auto" and bool(config.verifier_model))
+    if should_verify:
+        from evolution.verifier import verify_candidate
+        console.print("[bold]Verifier gate (different-family, blind A/B)[/bold]")
+        verdict = verify_candidate(
+            tasks=holdout_tasks,
+            rubrics=holdout_rubrics,
+            baseline_outputs=baseline_outputs,
+            candidate_outputs=candidate_outputs,
+            candidate_skill_text=evolved_full,
+            verifier_model=config.verifier_model or "",
+        )
+        metrics_payload["verifier"] = {
+            "model": config.verifier_model,
+            "status": verdict.status,
+            "wins": verdict.wins,
+            "losses": verdict.losses,
+            "ties": verdict.ties,
+            "position_inconsistent": verdict.position_inconsistent,
+            "ritual_hits": verdict.ritual_hits,
+            "reason": verdict.reason,
+        }
+        (out_dir / "metrics.json").write_text(json.dumps(metrics_payload, indent=2))
+        try:
+            ledger = Path("output") / "verifier-ledger.jsonl"
+            ledger.parent.mkdir(parents=True, exist_ok=True)
+            with ledger.open("a") as lf:
+                lf.write(json.dumps({**metrics_payload["verifier"], "skill": skill, "timestamp": ts}) + "\n")
+        except Exception:
+            pass
+        if verdict.status == "PASS":
+            console.print(f"[green]✓ verifier PASS: {verdict.reason}[/green]")
+        elif verdict.status == "FAIL":
+            console.print(f"[red]✗ verifier FAIL: {verdict.reason}[/red]")
+            (out_dir / "evolved_skill.md").rename(out_dir / "evolved_FAILED_verifier.md")
+            console.print(f"[red]✗ candidate vetoed by verifier — saved: {out_dir / 'evolved_FAILED_verifier.md'}[/red]")
+            raise SystemExit(1)
+        else:
+            console.print(f"[yellow]⚠ verifier {verdict.status}: {verdict.reason}[/yellow]")
+            (out_dir / "evolved_skill.md").rename(out_dir / "evolved_UNVERIFIED.md")
+            if verify == "on":
+                console.print(f"[red]✗ --verify on requires PASS; got {verdict.status} — no deploy[/red]")
+                raise SystemExit(1)
+            console.print(f"[yellow]  saved as {out_dir / 'evolved_UNVERIFIED.md'} — not deployed (use --verify off to skip)[/yellow]")
+            return
+    elif verify == "on":
+        console.print("[red]✗ --verify on but PI_EVOLUTION_VERIFIER is not set[/red]")
+        raise SystemExit(1)
+    else:
+        metrics_payload["verifier"] = {"status": "UNVERIFIED", "reason": "verifier not configured (auto/off)"}
+        (out_dir / "metrics.json").write_text(json.dumps(metrics_payload, indent=2))
 
     console.print(deploy(skill, found, evolved_full, out_dir))
     console.print("[green]✓ deployed for human review (nothing pushed, nothing applied to other skills)[/green]")

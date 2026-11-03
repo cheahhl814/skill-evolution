@@ -163,7 +163,7 @@ bin/evolve --skill <name> --eval-source golden \
 
 ## Procedure
 
-Full detail: `references/layer2-procedure.md`. The seven steps, in one line
+Full detail: `references/layer2-procedure.md`. The eight steps, in one line
 each:
 
 1. **Dry-run always.** `--dry-run` costs nothing; a mined count of **0 is a
@@ -180,6 +180,8 @@ each:
    repo on the evolve branch even when the commit fails.
 7. **Smoke the candidate (`--smoke`).** Lint cannot check that the skill's
    commands run; `bin/smoke-candidate` does.
+8. **Verify the candidate (`--verify`).** Independent-family blind A/B gate
+   vetoes ritual gaming; see §8 and `evolution/verifier.py`.
 
 ## Signature library — known failure signatures
 
@@ -201,6 +203,8 @@ cause and fix) is in `references/signature-library.md`.
 | --- | --- | --- |
 | `PI_EVOLUTION_OPTIMIZER` | `openai/gpt-4.1` | GEPA reflection/darwin optimizer model |
 | `PI_EVOLUTION_EVAL` | `openai/gpt-4.1-mini` | Eval/task model |
+| `PI_EVOLUTION_JUDGE` | *(falls back to `PI_EVOLUTION_EVAL`)* | Judge model (different family from eval recommended) |
+| `PI_EVOLUTION_VERIFIER` | *(unset → gate off)* | Verifier model — must be different family from optimizer/eval/judge |
 | `PI_EVOLUTION_MAX_SKILL` | 15360 | SKILL.md byte cap |
 | `PI_EVOLUTION_MAX_GROWTH` | 1.2 | Accepted byte growth vs baseline |
 | `PI_SKILL_*` | see `references/monitor-and-digest.md` §4–5 | Layer-1 telemetry, digest and suggestion controls |
@@ -220,6 +224,9 @@ cause and fix) is in `references/signature-library.md`.
   the structural gate when present.
 - Triage is read-only: it reads telemetry, ranks, and prints. It never runs
   the optimizer, never merges a branch, and never spends model tokens.
+- The verifier gate (when enabled) vetoes candidates that game the judge via
+  shared-family bias or rubric-parroting rituals; `UNAVAILABLE` never silently
+  passes.
 
 ## Handoff
 
