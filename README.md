@@ -31,7 +31,7 @@ are reviewed and released together.
 | `layer1/digest-schema.md` | The session-end digest format (what is written, where, and when it is skipped) |
 | `references/monitor-and-digest.md` | Full reference: telemetry weights, triage table, digest format, prompt suggestion, all knobs |
 | `references/layer1-write-policy.md` | Full reference: what `skill_manage` may write — the accumulated-experience bar, the user-approval gate, the skill-forge lint gate, the direct-edit gate, knobs, failure signatures |
-| `references/layer2-procedure.md` | Full reference: the seven-step offline evolution procedure (dry-run → ask-user gate → run → honest interpretation → review/merge → branch check → smoke) |
+| `references/layer2-procedure.md` | Full reference: the eight-step offline evolution procedure (dry-run → ask-user gate → run → honest interpretation → review/merge → branch check → smoke → verify) |
 | `evolution/` | The Python package (config, constraints, dataset builders, fitness, CLI) |
 | `evolution/monitor/` | Telemetry reader + triage ranking (upstream Hermes leaves this a placeholder) |
 | `bin/evolve` | CLI wrapper — the optimizer |
@@ -70,9 +70,11 @@ bin/evolve --skill my-skill --eval-source golden \
 ```
 
 Models via env: `PI_EVOLUTION_OPTIMIZER` (default `openai/gpt-4.1`),
-`PI_EVOLUTION_EVAL` (default `openai/gpt-4.1-mini`) — any DSPy LM string works
-(e.g. `ollama_chat/gemma4:31b-cloud`). Runs cost ~$2–10 on OpenAI models or
-~0 on ollama.
+`PI_EVOLUTION_EVAL` (default `openai/gpt-4.1-mini`), `PI_EVOLUTION_JUDGE`
+(fallback to `PI_EVOLUTION_EVAL` — use a different family from eval), `PI_EVOLUTION_VERIFIER`
+(unset → gate off; must be different family from optimizer/eval/judge) — any DSPy LM string works
+(e.g. `ollama_chat/gemma4:31b-cloud`, `anthropic/claude-sonnet-5-5`). Runs cost ~$2–10 on OpenAI models or
+~0 on ollama. Verifier adds ~20–40 calls on a 10–20-item holdout (`--verify auto` default).
 
 ## What it optimizes
 
@@ -102,6 +104,32 @@ bin/evolve --skill ncal --eval-source golden --dataset-path <golden.jsonl> --smo
 
 With `--smoke`, a candidate whose commands fail is rejected before deploy and
 saved as `evolved_FAILED_smoke.md`.
+
+## The independent verifier gate
+
+GEPA's judge can share a family with the optimizer (default both `openai/*`),
+so the optimizer learns to please the judge's blind spots — the ncal
+2026-10-28 ritual is one instance. The verifier is a post-GEPA, veto-only gate on a
+**different family** that catches this shared-bias gaming.
+
+| Mode | Behaviour |
+| --- | --- |
+| `--verify auto` (default) | Run when `PI_EVOLUTION_VERIFIER` is set; else mark `UNVERIFIED` and deploy |
+| `--verify on` | Require `PASS`; `FAIL`/`INCONCLUSIVE`/`UNAVAILABLE` vetoes deploy (no branch) |
+| `--verify off` | Skip the gate |
+
+The verifier sees only task + rubric + anonymised A/B outputs in both orders;
+a verdict counts only if both orders agree (absorbs position bias). It never
+sees the skill text or the diff — isolation is enforced by the function
+signature. A deterministic 4–6-gram ritual detector runs first and can veto
+without any model call. Diversity is checked at startup including `--dry-run`;
+unknown families are refused unless `--verifier-family-override` is given. The
+ledger `output/verifier-ledger.jsonl` accumulates judge/verifier/human
+agreement for later audit.
+
+```bash
+bin/evolve --skill ncal --eval-source golden --dataset-path <golden.jsonl> --verify auto
+```
 
 ## The monitor / triage step
 
@@ -205,12 +233,16 @@ recomputation.
 7. Frontmatter contract — name + description preserved
 8. skill-forge lint — `python3 skill-lint.py <skill-dir>` exit 0 (if detected)
 9. Optional pytest gate (`--run-tests`)
-10. Human review — deployment is a local branch or an `output/` file; nothing pushed
+10. Deterministic no-op short-circuit — identical body is `noop:true`, even if the proxy drifts
+11. Independent verifier (when enabled) — different-family blind A/B, ritual detector, fail-closed
+12. Human review — deployment is a local branch or an `output/` file; nothing pushed
 
 Anti-bloat: fitness applies a length penalty ramping 0→0.3 past 90% of budget.
 
 ## Design notes
 
+- **No-op short-circuit** — `evolved_body == baseline_body` (whitespace-normalised) is treated as a no-op before any gate, even if holdout scores drift from temperature; `metrics.json` records `noop:true`.
+- **The independent verifier** — `evolution/verifier.py` (`verify_candidate`, `detect_ritual_phrases`): post-GEPA, veto-only, `PI_EVOLUTION_VERIFIER` must differ from all of optimizer/eval/judge, cache key includes `prompt_version`, early-stop on majority loss, `output/verifier-ledger.jsonl` for cross-run audit; `family()` and the `gpt-oss → openai` mapping are pinned by `tests/test_verifier.py` and `tests/test_config_bug.py`.
 - **The GEPA metric is the LLMJudge rubric by default** (`--metric judge`, wired via
   `evolution.core.fitness.make_judge_metrics`): correctness 0.5 / procedure 0.3 /
   conciseness 0.2 − length penalty, scored against the ACTIVE candidate's
