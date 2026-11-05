@@ -201,7 +201,7 @@ the rubric judge before believing it.
 | `PI_EVOLUTION_OPTIMIZER` | `openai/gpt-4.1` | GEPA reflection/darwin optimizer model |
 | `PI_EVOLUTION_EVAL` | `openai/gpt-4.1-mini` | Eval/task model |
 | `PI_EVOLUTION_JUDGE` | *(falls back to `PI_EVOLUTION_EVAL`)* | Judge model (different family from eval recommended) |
-| `PI_EVOLUTION_VERIFIER` | *(unset → gate off)* | Verifier model — must be different family from optimizer/eval/judge |
+| `PI_EVOLUTION_VERIFIER` | *(unset → gate off)* | Verifier model — must be different family from optimizer/eval/judge. Policy (user, 2026-11-05): unset = auto-skip — the gate is opt-in, deploys are marked UNVERIFIED in the ledger; never silently passed |
 | `PI_EVOLUTION_MAX_SKILL` | 15360 | SKILL.md byte cap |
 | `PI_EVOLUTION_MAX_GROWTH` | 1.2 | Accepted byte growth vs baseline |
 | `PI_SKILL_*` | see `references/monitor-and-digest.md` §4–5 | Layer-1 telemetry, digest and suggestion controls |
