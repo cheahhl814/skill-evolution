@@ -133,7 +133,8 @@ managed 0.8, read 0.6, failed 1.5); `potential` = estimated payoff.
 `measure` deliberately outranks `evolve`: a used-but-unmeasured skill cannot
 be evolved responsibly yet. `bin/triage --extensions` runs the Layer-3 ranking
 (hook/UI extensions are `inherent` — they fire every session, dust is
-meaningless). Details: `references/monitor-and-digest.md` §6.
+meaningless). Every digest also carries a `### Drift (local-only)` table (`ext_drift.py` DIRTY/
+AHEAD/NO-ORIGIN/NO-GIT; `--check-drift` fetches to add BEHIND). §6.
 
 ## Extension suggests, agent acts
 

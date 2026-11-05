@@ -204,9 +204,11 @@ function recordToolUsage(toolName: string, rawInput: unknown): void {
 // /reload does not spam the digest directory.
 
 const TRIAGE_ON_SHUTDOWN = process.env.PI_SKILL_TRIAGE_ON_SHUTDOWN !== "0";
-// M1 (review): the ext triage gets its own, shorter budget so a shutdown never
-// blocks ~2x TRIAGE_TIMEOUT_MS worth of spawnSync.
-const EXT_TRIAGE_TIMEOUT_MS = Number(process.env.PI_SKILL_EXT_TRIAGE_TIMEOUT_MS ?? "5000");
+// M1 (review): the ext triage gets its own budget — a shutdown never blocks
+// TRIAGE_TIMEOUT_MS + EXT_TRIAGE_TIMEOUT_MS of spawnSync more than once.
+// Observed wall: ~4s at 30d window (session mining dominates; imports are
+// lazy). 5000 was too tight against that — 9000 stays bounded and safe.
+const EXT_TRIAGE_TIMEOUT_MS = Number(process.env.PI_SKILL_EXT_TRIAGE_TIMEOUT_MS ?? "9000");
 const EXT_TRIAGE_ON_SHUTDOWN = process.env.PI_SKILL_EXT_TRIAGE_ON_SHUTDOWN !== "0";
 const TRIAGE_TIMEOUT_MS = Number(process.env.PI_SKILL_TRIAGE_TIMEOUT_MS ?? "15000");
 const TRIAGE_TOP = Number(process.env.PI_SKILL_TRIAGE_TOP ?? "10");
