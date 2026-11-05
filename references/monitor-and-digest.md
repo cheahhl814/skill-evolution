@@ -110,6 +110,7 @@ Format contract: `layer1/digest-schema.md`.
 | `PI_SKILL_SUGGEST_MAX_AGE_DAYS` | 7 | a suggestion older than this is not injected |
 | `PI_SKILL_SUGGEST_REFRESH_MIN` | 30 | minutes between suggestion recomputations |
 | `PI_SKILL_EXT_TRIAGE_ON_SHUTDOWN` | 1 | `=0` skips the `### Extensions` digest subsection (Layer-3 triage stays on demand) |
+| `PI_SKILL_EXT_TRIAGE_TIMEOUT_MS` | 9000 | budget for the ext-triage (+drift) subprocess at shutdown |
 | `PI_EXTENSION_SCAN_ROOTS` | `~/.pi/agent/extensions` | `:`-separated extra extension deployment roots for the Layer-3 registry |
 
 ## 5. The prompt suggestion (the extension suggests, the agent acts)
@@ -183,6 +184,27 @@ Review round (Claude Code, 2026-11-05) hardening:
   actions (`action: "foo"`) are rejected in both the operations-array and the
   flat path; aliases (edit→patch, add→create, remove→delete) fold in both.
 - Tools claimed by >1 extension are flagged in `ExtensionUsage.ambiguous_tools`.
+
+Drift check (v1.2 — `evolution/monitor/ext_drift.py`): deployed copies vs
+their upstream repos. The registry's `repo_root` supplies the checkout; two
+modes by cost:
+- **local-only** (default, in every digest): `symbolic-ref`/ref reads + a
+  tracked-changes status — classifies DIRTY, LOCAL-AHEAD, NO-ORIGIN, NO-GIT,
+  or LOCAL-ONLY. Zero network; untracked scratch is excluded.
+- **fetched** (`--check-drift`): one `git fetch origin --quiet` per repo
+  first — adds BEHIND-BY-N. Opt-in; never on the shutdown path.
+
+Default-branch resolution order (live-run lesson): `origin/HEAD` symbolic-ref
+→ existing `refs/remotes/origin/main` or `origin/master` → the repo's current
+branch name → first `origin/*` non-HEAD ref. The naive "first origin/* ref"
+heuristic picks `origin/fork-v1` on repos carrying an `upstream` remote and
+reports a phantom LOCAL-AHEAD — fixed 2026-11-05.
+
+TS: no separate drift call — the digest's ext-triage subprocess (`--md`)
+appends the `### Drift (local-only)` section; its budget is
+`PI_SKILL_EXT_TRIAGE_TIMEOUT_MS` (9000; observed wall ~4s, session-mining
+dominates).
+
  Slash-command-only extensions cannot have their use
 attributed from toolResults in v1; their `dusty` verdict says so and stays
 a human call.

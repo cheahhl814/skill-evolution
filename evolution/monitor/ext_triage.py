@@ -172,6 +172,12 @@ def main(argv: list[str] | None = None) -> int:
 	ap.add_argument("--json", action="store_true", help="emit JSON instead of a markdown table")
 	ap.add_argument("--md", action="store_true", help="markdown table (default; explicit form for the digest)")
 	ap.add_argument("--suggest", action="store_true", help="print one actionable fix target as JSON or null")
+	ap.add_argument(
+		"--check-drift",
+		action="store_true",
+		help="git fetch before the drift check (network; detects BEHIND upstream). Default: local refs only",
+	)
+	ap.add_argument("--skip-drift", action="store_true", help="omit the drift table entirely")
 	ap.add_argument("--limit", type=int, default=20)
 	args = ap.parse_args([a for a in (argv if argv is not None else sys.argv[1:]) if a != "--extensions"])
 
@@ -193,6 +199,18 @@ def main(argv: list[str] | None = None) -> int:
 		print(json.dumps([r.to_dict() for r in rows], indent=2))
 	else:
 		print(render_markdown(rows, limit=args.limit))
+		if not args.skip_drift:
+			# Drift (v1.2): deployed copies vs their upstream repos. BEHIND
+			# detection needs --check-drift (git fetch); shutdown digests run
+			# local-only (DIRTY/AHEAD/NO-ORIGIN/NO-GIT), zero network.
+			from .ext_drift import check_all, render_markdown as render_drift
+
+			drift = check_all(facts, fetch=args.check_drift)
+			if drift:
+				print("")
+				print("### Drift" + (" (fetched)" if args.check_drift else " (local-only)"))
+				print("")
+				print(render_drift(drift, limit=args.limit))
 	return 0
 
 
