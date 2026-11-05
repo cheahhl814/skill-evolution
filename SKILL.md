@@ -139,8 +139,10 @@ AHEAD/NO-ORIGIN/NO-GIT; `--check-drift` fetches to add BEHIND). §6.
 ## Extension suggests, agent acts
 
 One suggestion per session (`--suggest` → highest-priority actionable target)
-is injected into the `skill_memory` prompt. Pointer only — nothing is spent;
-`review`/`dusty` targets are never suggested. `references/monitor-and-digest.md` §5.
+is injected into the `skill_memory` prompt — for skills AND, since v1.2,
+for the extension triage's `fix` target (async, so startup never blocks).
+Pointer only — nothing is spent; `review`/`dusty` targets are never
+suggested. `references/monitor-and-digest.md` §5.
 
 ## Layer 2 — invocation
 
