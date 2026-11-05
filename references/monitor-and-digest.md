@@ -109,6 +109,7 @@ Format contract: `layer1/digest-schema.md`.
 | `PI_SKILL_SUGGEST` | 1 | `0` disables the prompt suggestion |
 | `PI_SKILL_SUGGEST_MAX_AGE_DAYS` | 7 | a suggestion older than this is not injected |
 | `PI_SKILL_SUGGEST_REFRESH_MIN` | 30 | minutes between suggestion recomputations |
+| `PI_SKILL_EXT_SUGGEST` | 1 | `=0` disables the extension fix-target prompt injection |
 | `PI_SKILL_EXT_TRIAGE_ON_SHUTDOWN` | 1 | `=0` skips the `### Extensions` digest subsection (Layer-3 triage stays on demand) |
 | `PI_SKILL_EXT_TRIAGE_TIMEOUT_MS` | 9000 | budget for the ext-triage (+drift) subprocess at shutdown |
 | `PI_EXTENSION_SCAN_ROOTS` | `~/.pi/agent/extensions` | `:`-separated extra extension deployment roots for the Layer-3 registry |
@@ -146,6 +147,20 @@ Never push: the candidate is a local branch for human review.
 The suggestion is also recorded in the telemetry feed as
 `{"event": "suggestion", "skill": …, "op": <action>, "source": "triage"}`, so
 "did the agent act on the suggestion?" is answerable from the same JSONL.
+
+Extension suggestion (v1.2, same contract, different signal): the ext triage's
+`fix` target is injected into the same `skill_memory` section
+(`python -m evolution.monitor.ext_triage --suggest`). Because that subprocess
+mines session JSONLs (~4s), it is computed ASYNC at `session_start` and lands
+in the prompt when ready — startup never blocks; a slow first prompt simply
+has no extension line. Pointer only, zero spend, never pushed; patch the
+extension's SOURCE repo on a local branch. Telemetry event:
+`{"event": "ext_suggestion", "skill": <extension>, "op": <action>,
+"source": "ext_triage"}` (the `skill` field carries the extension name —
+skill-triage aggregation ignores unknown event kinds). Knob:
+`PI_SKILL_EXT_SUGGEST=0` disables; the refresh window and max-age are the
+skill suggestion's `PI_SKILL_SUGGEST_REFRESH_MIN` / `SUGGEST_MAX_AGE_DAYS`.
+
 
 ## 6. Layer-3 extension triage (post-hoc)
 

@@ -48,7 +48,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { spawnSync } from "node:child_process";
+import { execFile, spawnSync } from "node:child_process";
 import { StringEnum } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
@@ -485,25 +485,109 @@ function refreshSuggestion(): void {
 	if (s) record({ event: "suggestion", skill: s.skill, op: s.action, source: "triage" });
 }
 
+// ── extension suggestion (v1.2): the ext triage's `fix` target, injected ──
+// The ext triage mines session JSONLs (~4s), so its suggestion is computed
+// ASYNC at session_start and lands in the prompt when ready — startup never
+// blocks. Same "the extension suggests; the agent acts" contract: a pointer,
+// no spend; only `fix` targets are ever returned by --suggest.
+const EXT_SUGGEST_ENABLED = process.env.PI_SKILL_EXT_SUGGEST !== "0";
+
+type ExtSuggestion = {
+	extension: string;
+	action: string;
+	priority: number;
+	repo_root?: string | null;
+	reason: string;
+};
+
+let EXT_SUGGESTION: ExtSuggestion | null = null;
+let EXT_SUGGESTION_TS = 0;
+let EXT_SUGGESTION_REFRESHING = false;
+
+function runExtSuggestOnce(root: string): Promise<ExtSuggestion | null> {
+	return new Promise((resolve) => {
+		const venvPython = path.join(root, ".venv", "bin", "python");
+		const python = fs.existsSync(venvPython) ? venvPython : "python3";
+		execFile(
+			python,
+			["-m", "evolution.monitor.ext_triage", "--suggest"],
+			{
+				cwd: root,
+				env: { ...process.env, PYTHONPATH: root },
+				timeout: EXT_TRIAGE_TIMEOUT_MS,
+				maxBuffer: 1024 * 1024,
+			},
+			(err, stdout) => {
+					if (err || !stdout) return resolve(null);
+				try {
+					const parsed = JSON.parse(String(stdout).trim());
+					if (!parsed || typeof parsed.extension !== "string") return resolve(null);
+					resolve(parsed as ExtSuggestion);
+				} catch {
+					resolve(null);
+				}
+			},
+		);
+	});
+}
+
+/** Kick the ext-suggestion recompute (async; at most one in flight per refresh window). */
+function refreshExtSuggestion(): void {
+	if (!EXT_SUGGEST_ENABLED || EXT_SUGGESTION_REFRESHING) return;
+	const now = Date.now();
+	if (EXT_SUGGESTION_TS && now - EXT_SUGGESTION_TS < SUGGEST_REFRESH_MS) return;
+	const root = resolveEvolutionRoot();
+	if (!root) return;
+	EXT_SUGGESTION_REFRESHING = true;
+	EXT_SUGGESTION_TS = now; // stamped at launch: one recompute per window even if slow
+	runExtSuggestOnce(root)
+		.then((s) => {
+			EXT_SUGGESTION = s;
+			if (s) record({ event: "ext_suggestion", skill: s.extension, op: s.action, source: "ext_triage" });
+		})
+		.catch(() => {
+			/* best effort */
+		})
+		.finally(() => {
+			EXT_SUGGESTION_REFRESHING = false;
+		});
+}
+
 /** The prompt lines for the current suggestion (empty when there is none). */
 function suggestionLines(): string[] {
-	if (!SUGGEST_ENABLED || !SUGGESTION) return [];
-	if (Date.now() - SUGGESTION_TS > SUGGEST_MAX_AGE_MS) return [];
-	const s = SUGGESTION;
-	return [
-		"",
-		"Skill self-improvement: the triage digest ranks `" +
-			s.skill +
-			"` as the next target (action: " +
-			s.action +
-			", priority " +
-			s.priority.toFixed(2) +
-			"). " +
-			s.reason +
-			".",
-		"Act on it only when the user asks to improve a skill; run `bin/evolve --dry-run` first and keep the",
-		"ask-user cost gate before any model spend. Never push: the candidate is a local branch for human review.",
-	];
+	const lines: string[] = [];
+	// skill suggestion (sync-computed from the Layer-1 telemetry)
+	if (SUGGEST_ENABLED && SUGGESTION && Date.now() - SUGGESTION_TS <= SUGGEST_MAX_AGE_MS) {
+		const s = SUGGESTION;
+		lines.push(
+			"",
+			"Skill self-improvement: the triage digest ranks `" +
+				s.skill +
+				"` as the next target (action: " +
+				s.action +
+				", priority " +
+				s.priority.toFixed(2) +
+				"). " +
+				s.reason +
+				".",
+			"Act on it only when the user asks to improve a skill; run `bin/evolve --dry-run` first and keep the",
+			"ask-user cost gate before any model spend. Never push: the candidate is a local branch for human review.",
+		);
+	}
+	// Layer-3 pointer: extension fix target (async-computed; may not be ready
+	// in the first prompt of a session — degradation is silent, harmless).
+	// NOT gated on the skill suggestion: either pointer can exist alone.
+	if (EXT_SUGGEST_ENABLED && EXT_SUGGESTION && Date.now() - EXT_SUGGESTION_TS <= SUGGEST_MAX_AGE_MS) {
+		const e = EXT_SUGGESTION;
+		lines.push(
+			"",
+			"Extension monitor: the ext triage ranks `" + e.extension + "` as the next fix target (action: " + e.action + ", priority " + e.priority.toFixed(2) + "). " +
+				e.reason + ".",
+			"Act on it only when the user asks to fix the extension; patch the extension's SOURCE repo on a local",
+			"branch for human review. Never push; no model spend without the ask-user gate.",
+		);
+	}
+	return lines;
 }
 
 // ── path safety (mirrors pi's own "escapes the skills dir" contract) ───────
@@ -1115,6 +1199,7 @@ export default function skillMemoryExtension(pi: ExtensionAPI) {
 		nudgeDelivered = false;
 		record({ event: "session_start", reason: String((event as { reason?: string })?.reason ?? "") });
 		refreshSuggestion();
+		refreshExtSuggestion();
 	});
 
 	pi.on("tool_call", (event) => {

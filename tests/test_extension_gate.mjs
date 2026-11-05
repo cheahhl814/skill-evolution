@@ -825,6 +825,66 @@ test("flat shorthand: delete requires the explicit action (H1)", async () => {
 	} finally { t.cleanup(); }
 });
 
+test("ext suggestion: a 2-session fix target is injected into the skill_memory section", async () => {
+	// The registry resolves ~/.pi/agent/extensions via HOME — under the throwaway
+	// HOME it would be empty, so point PI_EXTENSION_SCAN_ROOTS at the real one
+	// (read-only scan; PI_SESSIONS_ROOT below keeps the mining synthetic).
+	const t = await loadTool({ PI_EXTENSION_SCAN_ROOTS: path.join(REAL_HOME, ".pi", "agent", "extensions") });
+	try {
+		// synthesize sessions: chartz-renderer (render_chart) errors across 2 sessions
+		const sess = path.join(t.home, "sessions", "proj");
+		fs.mkdirSync(sess, { recursive: true });
+		process.env.PI_SESSIONS_ROOT = path.join(t.home, "sessions");
+		const mk = (session, isError, n) => {
+			const recs = [{ type: "session", id: session }];
+			for (let i = 0; i < n; i++)
+				recs.push({
+					type: "message",
+					id: session + i,
+					// M3: records without a parseable timestamp are skipped — fixture records carry one
+					timestamp: new Date().toISOString(),
+					message: { role: "toolResult", toolCallId: "c" + i, toolName: "render_chart", isError, durationMs: 1, content: [{ type: "text", text: "boom" }] },
+				});
+			fs.writeFileSync(path.join(sess, session + ".jsonl"), recs.map((r) => JSON.stringify(r)).join("\n") + "\n");
+		};
+		const ts = new Date().toISOString();
+		mk("s-one", true, 1);
+		mk("s-two", true, 1);
+		await t.pi.emit("session_start", { reason: "startup" }, { hasUI: false, ui: {} });
+		// async refresh: poll until the suggestion lands (ext triage mines ~1-4s)
+		const until = Date.now() + 15000;
+		let injected = false;
+		while (Date.now() < until && !injected) {
+			await new Promise((r) => setTimeout(r, 500));
+			const ev = { systemPromptOptions: { sections: {} } };
+			await t.pi.emit("before_agent_start", ev, { hasUI: false, ui: {} });
+			const section = ev.systemPromptOptions.sections.skill_memory ?? "";
+			injected = /Extension monitor: the ext triage ranks `[\w.-]+`/.test(section) && /render_chart|chartz/.test(section);
+		}
+		assert.ok(injected, "the ext fix-target suggestion must be injected when a fix target exists");
+	} finally {
+		delete process.env.PI_SESSIONS_ROOT;
+		t.cleanup();
+	}
+});
+
+test("ext suggestion: no fix target → no injection, harmless", async () => {
+	const t = await loadTool();
+	try {
+		process.env.PI_SESSIONS_ROOT = path.join(t.home, "no-such-sessions");
+		await t.pi.emit("session_start", { reason: "startup" }, { hasUI: false, ui: {} });
+		await new Promise((r) => setTimeout(r, 1200));
+		const ev = { systemPromptOptions: { sections: {} } };
+		await t.pi.emit("before_agent_start", ev, { hasUI: false, ui: {} });
+		const section = ev.systemPromptOptions.sections.skill_memory ?? "";
+		assert.ok(!/Extension monitor: the ext triage ranks/.test(section));
+		assert.match(section, /Skills-first for task knowledge/); // the base section is intact
+	} finally {
+		delete process.env.PI_SESSIONS_ROOT;
+		t.cleanup();
+	}
+});
+
 // ── runner ─────────────────────────────────────────────────────────────────
 let failed = 0;
 for (const [name, fn] of tests) {
