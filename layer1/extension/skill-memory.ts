@@ -204,6 +204,7 @@ function recordToolUsage(toolName: string, rawInput: unknown): void {
 // /reload does not spam the digest directory.
 
 const TRIAGE_ON_SHUTDOWN = process.env.PI_SKILL_TRIAGE_ON_SHUTDOWN !== "0";
+const EXT_TRIAGE_ON_SHUTDOWN = process.env.PI_SKILL_EXT_TRIAGE_ON_SHUTDOWN !== "0";
 const TRIAGE_TIMEOUT_MS = Number(process.env.PI_SKILL_TRIAGE_TIMEOUT_MS ?? "15000");
 const TRIAGE_TOP = Number(process.env.PI_SKILL_TRIAGE_TOP ?? "10");
 const DIGEST_DIR =
@@ -234,6 +235,29 @@ function resolveEvolutionRoot(): string | null {
 		}
 	}
 	return null;
+}
+
+/** Run `python -m evolution.monitor.ext_triage --md`. Returns null on any failure. */
+function runExtTriage(root: string): string | null {
+	const venvPython = path.join(root, ".venv", "bin", "python");
+	const python = fs.existsSync(venvPython) ? venvPython : "python3";
+	try {
+		const res = spawnSync(
+			python,
+			["-m", "evolution.monitor.ext_triage", "--md"],
+			{
+				cwd: root,
+				env: { ...process.env, PYTHONPATH: root },
+				encoding: "utf8",
+				timeout: TRIAGE_TIMEOUT_MS,
+				maxBuffer: 1024 * 1024,
+			},
+		);
+		if (res.status !== 0 || !res.stdout) return null;
+		return res.stdout.trim();
+	} catch {
+		return null;
+	}
 }
 
 /** Run `python -m evolution.monitor.triage --json`. Returns null on any failure. */
@@ -360,6 +384,17 @@ function writeDigest(rows: TriageRow[], counts: { skills: number; loaded: number
 			);
 		});
 		lines.push("");
+		// Layer-3: extension triage (post-hoc session mining; never breaks the digest)
+		if (EXT_TRIAGE_ON_SHUTDOWN) {
+			const evoRoot = resolveEvolutionRoot();
+			const extMd = evoRoot ? runExtTriage(evoRoot) : null;
+			if (extMd) {
+				lines.push("### Extensions (post-hoc, 30d)");
+				lines.push("");
+				lines.push(extMd);
+				lines.push("");
+			}
+		}
 		const section = lines.join("\n");
 
 		fs.mkdirSync(DIGEST_DIR, { recursive: true });

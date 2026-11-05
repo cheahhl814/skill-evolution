@@ -305,6 +305,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--half-life", type=float, default=14.0, help="recency half-life in days")
     ap.add_argument("--limit", type=int, default=20, help="rows to print")
     ap.add_argument("--json", action="store_true", help="emit JSON instead of a table")
+    ap.add_argument(
+        "--extensions",
+        action="store_true",
+        help="rank extensions instead of skills (delegates to ext_triage; same flags)",
+    )
     ap.add_argument("--only-action", default=None, help="filter rows by action (measure/evolve/shrink/...)")
     ap.add_argument(
         "--suggest",
@@ -312,6 +317,10 @@ def main(argv: list[str] | None = None) -> int:
         help="print ONE actionable target as JSON (the extension's prompt suggestion), or null",
     )
     args = ap.parse_args(argv)
+
+    if args.extensions:
+        from .ext_triage import main as ext_main
+        return ext_main(argv)
 
     usage = load_usage(args.telemetry, half_life_days=args.half_life)
     facts = inventory(skill_roots(args.root) if args.root else None)
@@ -322,6 +331,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.suggest:
         print(json.dumps(suggest(rows)))
         return 0
+    if args.extensions:
+        from .ext_triage import main as ext_main
+        return ext_main(argv)
     if args.json:
         print(json.dumps([r.to_dict() for r in rows], indent=2))
     else:

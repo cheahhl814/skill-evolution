@@ -16,6 +16,14 @@ appends a digest section. This file is the contract for that artifact.
 | Pruning | `.md` files older than `PI_SKILL_TRIAGE_DIGEST_KEEP_DAYS` (30) are removed; `latest.md` and `state.json` are kept |
 | Cost | zero — the monitor (`evolution/monitor/triage.py`) is stdlib-only and makes no model calls |
 
+The same shutdown cycle also runs the Layer-3 extension triage
+(`evolution/monitor/ext_triage.py --md`, stdlib-only, same timeout) and
+appends a `### Extensions (post-hoc, 30d)` subsection after the skill table.
+It is skipped when the extension monitor subprocess fails, when the digest
+is skipped anyway (reload), or with `PI_SKILL_EXT_TRIAGE_ON_SHUTDOWN=0`.
+Extension rows: action ∈ {fix, watch, healthy, dusty, inherent}; `suggest`
+never serves dusty/inherent rows.
+
 The directory lives **outside** the skill tree: digests are runtime data, not
 a deliverable, and must never be committed.
 
