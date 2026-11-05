@@ -43,6 +43,9 @@ class ExtensionUsage:
 	calls: int = 0
 	errors: int = 0
 	sessions: set[str] = field(default_factory=set)
+	error_sessions: set[str] = field(default_factory=set)
+	#: tool names claimed by >1 extension - attribution is split across owners
+	ambiguous_tools: set[str] = field(default_factory=set)
 	score: float = 0.0
 
 	@property
@@ -63,8 +66,16 @@ class ExtensionUsage:
 
 
 def _parse_ts(value: object) -> Optional[float]:
-	if isinstance(value, (int, float)) and value > 10 ** 12:  # epoch ms
-		return float(value) / 1000.0
+	"""Epoch seconds (float>1e9), epoch ms (>1e12), or ISO string → seconds.
+	M3 (review): returns None only for truly unparseable values; the caller
+	SKIPS such records instead of counting them as age-0."""
+	if isinstance(value, (int, float)):
+		v = float(value)
+		if v > 1e12:  # epoch ms
+			return v / 1000.0
+		if v > 1e9:  # epoch seconds
+			return v
+		return None
 	if isinstance(value, str):
 		t = value.strip().replace("Z", "+00:00")
 		try:
@@ -122,11 +133,19 @@ def mine_sessions(
 					if not owners:
 						continue
 					ts = _parse_ts(rec.get("timestamp"))
-					if ts is not None and ts < cutoff:
+					if ts is None:
+						# M3 (review): a record with an unparseable/missing timestamp
+						# cannot be window-filtered or decayed — skip it instead of
+						# pretending it happened now.
+						continue
+					if ts < cutoff:
 						continue
 					is_error = bool(m.get("isError"))
 					age_days = max(0.0, (now_ts - ts) / 86400.0) if ts is not None else 0.0
 					decay = 0.5 ** (age_days / half_life)
+					if len(owners) > 1:
+						for _own in owners:
+							usage.setdefault(_own, ExtensionUsage(name=_own)).ambiguous_tools.add(tool)
 					for owner in owners:
 						u = usage.get(owner)
 						if u is None:
@@ -136,6 +155,7 @@ def mine_sessions(
 						u.sessions.add(session_id)
 						if is_error:
 							u.errors += 1
+							u.error_sessions.add(session_id)
 		except OSError:
 			continue
 	return usage

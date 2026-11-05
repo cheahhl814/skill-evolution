@@ -6,11 +6,11 @@ for them):
 
 | Facts                                              | potential | action    |
 | -------------------------------------------------- | --------- | --------- |
-| tool-extension with recent tool errors (>=2)       | 0.95      | `fix`     |
-| tool-extension used with exactly 1 error           | 0.55      | `watch`   |
+| tool-extension with errors in ≥2 sessions          | 0.95      | `fix`     |
+| tool-extension, 1 error or errors in 1 session     | 0.55      | `watch`   |
 | tool-extension used, error-free                    | 0.40      | `healthy` |
 | tool-extension, zero attributed calls in window    | 0.35      | `dusty`   |
-| hook/UI extension (no registered tools)            | 0.00      | ` inherent` |
+| hook/UI extension (no registered tools)            | 0.00      | `inherent` |
 
 Only `fix` is actionable in `suggest()` — a patch to the extension's source
 repo (the symlink target), deployed as a local branch for human review.
@@ -73,15 +73,25 @@ def _potential(facts: ExtensionFacts, usage: ExtensionUsage, window_days: float)
 		if facts.commands and not facts.tools:
 			return (0.35, "dusty", "slash-command-only: toolResult attribution cannot see command use (v1 limitation) — judge dustiness by hand")
 		return (0.35, "dusty", "no attributed tool calls in the last %.0fd — prune it or fix its triggers" % window_days)
-	if usage.errors >= 2:
+	# M4 (review): `fix` requires errors in ≥2 DISTINCT sessions — an agent's
+	# own gate refusals ("not approved", "no UI", validation errors) come back
+	# as isError toolResults and can cluster in a single session; that is the
+	# gate working, not a defect. One flaky error is never `fix` either
+	# (randomness ≠ causality, the open-world paper's lesson).
+	if usage.errors >= 2 and len(usage.error_sessions) >= 2:
 		return (
 			0.95,
 			"fix",
-			"%d failed tool calls out of %d in %.0fd — patch the source repo (branch + human review)"
-			% (usage.errors, usage.calls, window_days),
+			"%d failed tool calls across %d sessions out of %d in %.0fd — patch the source repo (branch + human review)"
+			% (usage.errors, len(usage.error_sessions), usage.calls, window_days),
 		)
-	if usage.errors == 1:
-		return (0.55, "watch", "1 failed call in %.0fd — could be environmental noise; check whether it repeats" % window_days)
+	if usage.errors == 1 or (usage.errors >= 2 and len(usage.error_sessions) == 1):
+		return (
+			0.55,
+			"watch",
+			"%d failed call(s) in %.0fd (error sessions: %d) — could be environmental noise or clustered gate refusals; check whether it repeats"
+			% (usage.errors, window_days, len(usage.error_sessions)),
+		)
 	return (0.40, "healthy", "%d calls in %.0fd, no errors" % (usage.calls, window_days))
 
 

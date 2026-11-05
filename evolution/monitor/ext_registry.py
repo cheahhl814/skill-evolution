@@ -52,9 +52,11 @@ KNOWN_EXTRA_TOOLS: dict[str, list[str]] = {
 	"pi-mem-wiki": ["wiki_read"],
 	# package-doctor lives in a subdirectory; regex is tuned for it, keep a guard.
 	"package-doctor": ["package_doctor"],
-	# chartz-renderer registers by identifier reference: registerTool(listEngines)
-	# — no string literal, so regex cannot see the names.
-	"chartz-renderer.ts": ["listEngines", "renderChart"],
+	# chartz-renderer registers by identifier reference: registerTool(renderChart)
+	# — no string literal, so regex cannot see the names. (LOW, review): the
+	# live session toolNames are the snake_case forms below, verified against
+	# the session JSONLs 2026-11-05.
+	"chartz-renderer.ts": ["list_chartz_engines", "render_chart"],
 }
 
 #: How deep / how broad to recurse when a deployment is a directory.

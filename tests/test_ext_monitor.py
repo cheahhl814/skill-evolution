@@ -201,12 +201,14 @@ class TestTriage:
         # hook extension excluded from priority ranking
         assert by_ext["h.ts"].priority == 0.0
 
-    def test_fix_fires_on_two_errors(self, tmp_path, ext_root):
+    def test_fix_requires_errors_across_two_sessions(self, tmp_path, ext_root):
         facts = self._facts(ext_root)
         now = datetime.now(timezone.utc)
         ts = now.isoformat().replace("+00:00", "Z")
         sessions = tmp_path / "sessions"
-        write_session(sessions, "s1", [{"toolName": "alpha", "isError": True}] * 2, ts)
+        # M4 (review): two errors across two DISTINCT sessions is a defect → fix.
+        write_session(sessions, "s1", [{"toolName": "alpha", "isError": True}], ts)
+        write_session(sessions, "s2", [{"toolName": "alpha", "isError": True}], ts)
         usage = eu.mine_sessions(facts=facts, sessions_root=sessions, now=now.timestamp())
         rows = et.triage_ext(facts=facts, usage=usage)
         row = next(r for r in rows if r.extension == "t.ts")
@@ -214,6 +216,47 @@ class TestTriage:
         assert row.priority > 0
         s = et.suggest(rows)
         assert s and s["extension"] == "t.ts"
+
+    def test_two_errors_in_one_session_is_watch_not_fix(self, tmp_path, ext_root):
+        facts = self._facts(ext_root)
+        now = datetime.now(timezone.utc)
+        ts = now.isoformat().replace("+00:00", "Z")
+        sessions = tmp_path / "sessions"
+        # M4 (review): clustered errors in ONE session = the gate working, not a defect.
+        write_session(sessions, "s1", [{"toolName": "alpha", "isError": True}] * 2, ts)
+        usage = eu.mine_sessions(facts=facts, sessions_root=sessions, now=now.timestamp())
+        rows = et.triage_ext(facts=facts, usage=usage)
+        row = next(r for r in rows if r.extension == "t.ts")
+        assert row.errors == 2
+        assert row.action == "watch"
+        assert et.suggest(rows) is None
+
+    def test_ambiguous_tool_flags_all_owners(self, tmp_path, ext_root):
+        er_ = er  # module alias clarity
+        make_ext(ext_root, "x.ts", 'pi.registerTool({ name: "shared" })')
+        make_ext(ext_root, "y.ts", 'pi.registerTool({ name: "shared" })')
+        facts = er_.scan_extensions([ext_root])
+        now = datetime.now(timezone.utc)
+        ts = now.isoformat().replace("+00:00", "Z")
+        sessions = tmp_path / "sessions"
+        write_session(sessions, "s1", [{"toolName": "shared"}], ts)
+        usage = eu.mine_sessions(facts=facts, sessions_root=sessions, now=now.timestamp())
+        assert usage["x.ts"].ambiguous_tools == {"shared"}
+        assert usage["y.ts"].ambiguous_tools == {"shared"}
+
+    def test_unparseable_timestamp_record_skipped(self, tmp_path, ext_root):
+        make_ext(ext_root, "z.ts", 'pi.registerTool({ name: "alpha" })')
+        facts = er.scan_extensions([ext_root])
+        now = datetime.now(timezone.utc)
+        (tmp_path / "sessions" / "p").mkdir(parents=True)
+        recs = [
+            {"type": "session", "id": "s1"},
+            {"type": "message", "id": "1",
+             "message": {"role": "toolResult", "toolCallId": "c1", "toolName": "alpha", "isError": True}},
+        ]
+        (tmp_path / "sessions" / "p" / "s1.jsonl").write_text("\n".join(json.dumps(r) for r in recs) + "\n")
+        usage = eu.mine_sessions(facts=facts, sessions_root=tmp_path / "sessions", now=now.timestamp())
+        assert usage["z.ts"].calls == 0  # M3 (review): no timestamp → skipped, not age-0
 
     def test_single_error_is_watch_not_fix(self, tmp_path, ext_root):
         facts = self._facts(ext_root)

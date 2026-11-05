@@ -167,7 +167,23 @@ half of the harness: deployed extensions. Same philosophy, different signal:
 
 A `fix` patch targets the extension's SOURCE repo (the symlink target),
 deployed as a local branch for human review — the same deploy contract as
-Layer 2, never pushed. Slash-command-only extensions cannot have their use
+Layer 2, never pushed.
+
+Review round (Claude Code, 2026-11-05) hardening:
+- `fix` requires errors in **≥2 distinct sessions** — clustered gate refusals
+  ("not approved", "no UI", validation errors) come back as isError
+  toolResults and are the gate working, not a defect.
+- The ext triage subprocess has its own 5s budget
+  (`PI_SKILL_EXT_TRIAGE_TIMEOUT_MS`) so shutdown never blocks ~2x the skill
+  triage timeout.
+- Records with unparseable/missing timestamps are SKIPPED, not counted as
+  age-0 (they could inflate `fix`).
+- Destructive inference is banned: a flat `{ name, file_path }` call WITHOUT
+  an explicit action is rejected, never turned into `remove_file`; unknown
+  actions (`action: "foo"`) are rejected in both the operations-array and the
+  flat path; aliases (edit→patch, add→create, remove→delete) fold in both.
+- Tools claimed by >1 extension are flagged in `ExtensionUsage.ambiguous_tools`.
+ Slash-command-only extensions cannot have their use
 attributed from toolResults in v1; their `dusty` verdict says so and stays
 a human call.
 
