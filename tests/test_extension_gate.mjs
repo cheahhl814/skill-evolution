@@ -727,6 +727,104 @@ test("direct edit: a non-SKILL.md file is never gated", async () => {
 	}
 });
 
+// ── inferOps flat-shorthand + action-tolerance tests (review round) ────────
+// B2 (review): the flat single-op shorthand and H1/H2 rejection cases were
+// previously tested nowhere. These drive the REAL tool execute() with a
+// throwaway HOME, same as the other gate tests.
+
+function existingSkill(t, name, body = "# " + name + "\n\nold body.\n") {
+	const dir = path.join(t.skills, name);
+	fs.mkdirSync(dir, { recursive: true });
+	fs.writeFileSync(path.join(dir, "SKILL.md"), body);
+	seedEvidence(t.home, name, { sessions: 2, revisits: 3, failures: 1 });
+	return dir;
+}
+
+const APPROVE = ctxWith(async () => true);
+
+test("flat shorthand: { name, old_string, new_string } patches the deployed SKILL.md", async () => {
+	const t = await loadTool();
+	try {
+		existingSkill(t, "demo-flat");
+		const res = await t.tool.execute("f1",
+			{ name: "demo-flat", old_string: "old body.", new_string: "new body." },
+			undefined, undefined, APPROVE);
+		assert.equal(res.details.ok, true, JSON.stringify(res.details));
+		const after = fs.readFileSync(path.join(t.skills, "demo-flat", "SKILL.md"), "utf8");
+		assert.match(after, /new body\./);
+	} finally { t.cleanup(); }
+});
+
+test("flat shorthand create: single op cannot ship a README in-batch → lint rejects with guidance", async () => {
+	const t = await loadTool();
+	try {
+		seedProposals(t.home, "demo-flat-new");
+		let asked = 0;
+		const res = await t.tool.execute("f2",
+			{ name: "demo-flat-new", content: skillMd("demo-flat-new", { readme: false }) },
+			undefined, undefined,
+			ctxWith(async () => { asked++; return true; }));
+		assert.equal(asked, 1, "create must still ask once");
+		assert.equal(res.details.ok, false);
+		assert.match(res.details.error, /README\.md/);
+		// nothing may be committed on lint failure
+		assert.equal(fs.existsSync(path.join(t.skills, "demo-flat-new")), false);
+	} finally { t.cleanup(); }
+});
+
+test("flat shorthand with file_path but NO action is REJECTED, never interpreted as remove_file (H1)", async () => {
+	const t = await loadTool();
+	try {
+		const dir = existingSkill(t, "demo-h1");
+		const before = fs.readFileSync(path.join(dir, "SKILL.md"), "utf8");
+		const res = await t.tool.execute("f3",
+			{ name: "demo-h1", file_path: "SKILL.md" },
+			undefined, undefined, APPROVE);
+		assert.equal(res.details.ok, false);
+		assert.match(res.details.error, /operations|shorthand|actions/i);
+		assert.equal(fs.readFileSync(path.join(dir, "SKILL.md"), "utf8"), before, "no deletion may happen");
+	} finally { t.cleanup(); }
+});
+
+test("flat shorthand with unknown action is rejected (H2)", async () => {
+	const t = await loadTool();
+	try {
+		existingSkill(t, "demo-h2");
+		const res = await t.tool.execute("f4",
+			{ name: "demo-h2", action: "foo", content: "x" },
+			undefined, undefined, APPROVE);
+		assert.equal(res.details.ok, false);
+		assert.match(res.details.error, /operations|actions/i);
+	} finally { t.cleanup(); }
+});
+
+test("canonical operations entry with action 'edit' is alias-folded to patch and applied (H2)", async () => {
+	const t = await loadTool();
+	try {
+		existingSkill(t, "demo-alias");
+		const res = await t.tool.execute("f5",
+			{ operations: [{ action: "edit", name: "demo-alias", old_string: "old body.", new_string: "edited body." }] },
+			undefined, undefined, APPROVE);
+		assert.equal(res.details.ok, true, JSON.stringify(res.details));
+		assert.match(fs.readFileSync(path.join(t.skills, "demo-alias", "SKILL.md"), "utf8"), /edited body\./);
+	} finally { t.cleanup(); }
+});
+
+test("flat shorthand: delete requires the explicit action (H1)", async () => {
+	const t = await loadTool();
+	try {
+		existingSkill(t, "demo-del");
+		const res = await t.tool.execute("f6",
+			{ name: "demo-del" },
+			undefined, undefined, APPROVE);
+		assert.equal(res.details.ok, false);
+		const res2 = await t.tool.execute("f7",
+			{ name: "demo-del", action: "delete" },
+			undefined, undefined, APPROVE);
+		assert.equal(res2.details.ok, true, JSON.stringify(res2.details));
+	} finally { t.cleanup(); }
+});
+
 // ── runner ─────────────────────────────────────────────────────────────────
 let failed = 0;
 for (const [name, fn] of tests) {

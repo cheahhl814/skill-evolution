@@ -305,6 +305,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--half-life", type=float, default=14.0, help="recency half-life in days")
     ap.add_argument("--limit", type=int, default=20, help="rows to print")
     ap.add_argument("--json", action="store_true", help="emit JSON instead of a table")
+    ap.add_argument(
+        "--extensions",
+        action="store_true",
+        help="rank extensions instead of skills (delegates to ext_triage; same flags)",
+    )
     ap.add_argument("--only-action", default=None, help="filter rows by action (measure/evolve/shrink/...)")
     ap.add_argument(
         "--suggest",
@@ -312,6 +317,31 @@ def main(argv: list[str] | None = None) -> int:
         help="print ONE actionable target as JSON (the extension's prompt suggestion), or null",
     )
     args = ap.parse_args(argv)
+
+    if args.extensions:
+        # M2 (review): the two triages share a CLI surface but not every flag —
+        # --telemetry/--only-action are skill-triage-only; --root means a SKILL
+        # root here and an EXTENSION root on the ext CLI. Strip the skill-only
+        # flags so delegation never exits 2 on them, and warn that the two
+        # surfaces differ.
+        import sys as _sys
+
+        _SKILL_ONLY = {"--telemetry", "--only-action"}
+        passthrough: list[str] = []
+        for flag in _SKILL_ONLY:
+            i = argv.index(flag) if flag in (argv or []) else -1
+            if i >= 0:
+                print(
+                    f"note: {flag} is a skill-triage-only flag; ignored for --extensions",
+                    file=_sys.stderr,
+                )
+                if i + 1 < len(argv) and not argv[i + 1].startswith("-"):
+                    argv = argv[:i] + argv[i + 2 :]
+                else:
+                    argv = argv[:i] + argv[i + 1 :]
+        from .ext_triage import main as ext_main
+
+        return ext_main(argv)
 
     usage = load_usage(args.telemetry, half_life_days=args.half_life)
     facts = inventory(skill_roots(args.root) if args.root else None)

@@ -109,6 +109,8 @@ Format contract: `layer1/digest-schema.md`.
 | `PI_SKILL_SUGGEST` | 1 | `0` disables the prompt suggestion |
 | `PI_SKILL_SUGGEST_MAX_AGE_DAYS` | 7 | a suggestion older than this is not injected |
 | `PI_SKILL_SUGGEST_REFRESH_MIN` | 30 | minutes between suggestion recomputations |
+| `PI_SKILL_EXT_TRIAGE_ON_SHUTDOWN` | 1 | `=0` skips the `### Extensions` digest subsection (Layer-3 triage stays on demand) |
+| `PI_EXTENSION_SCAN_ROOTS` | `~/.pi/agent/extensions` | `:`-separated extra extension deployment roots for the Layer-3 registry |
 
 ## 5. The prompt suggestion (the extension suggests, the agent acts)
 
@@ -143,4 +145,45 @@ Never push: the candidate is a local branch for human review.
 The suggestion is also recorded in the telemetry feed as
 `{"event": "suggestion", "skill": …, "op": <action>, "source": "triage"}`, so
 "did the agent act on the suggestion?" is answerable from the same JSONL.
+
+## 6. Layer-3 extension triage (post-hoc)
+
+`evolution.monitor.ext_triage` (`bin/triage --extensions`) ranks the OTHER
+half of the harness: deployed extensions. Same philosophy, different signal:
+
+- `ext_registry.py` inventories `~/.pi/agent/extensions/` (+
+  `PI_EXTENSION_SCAN_ROOTS`): symlink-resolves each deployment, records its
+  git checkout root, and extracts registered tools/commands/hooks by regex
+  (hand-curated `KNOWN_EXTRA_TOOLS` covers regex blind spots). Regex hits
+  are additive only — overrides never subtract.
+- `ext_usage.py` attributes `toolResult` records (`toolName`, `isError`,
+  timestamp) from `~/.pi/agent/sessions/*/*.jsonl` to extensions over a
+  30-day window, with the same recency-decay semantics as skill usage.
+- `ext_triage.py` ranks: `fix` (≥2 errors) > `watch` (1 error) >
+  `healthy` > `dusty` (0 calls) > `inherent` (hook/UI-only, excluded).
+  Only `fix` is suggested. The ≥2-error floor is deliberate: ONE failed
+  call can be environmental noise (network timeout, transient 429) — do
+  not confuse randomness with causality (the open-world paper's lesson).
+
+A `fix` patch targets the extension's SOURCE repo (the symlink target),
+deployed as a local branch for human review — the same deploy contract as
+Layer 2, never pushed.
+
+Review round (Claude Code, 2026-11-05) hardening:
+- `fix` requires errors in **≥2 distinct sessions** — clustered gate refusals
+  ("not approved", "no UI", validation errors) come back as isError
+  toolResults and are the gate working, not a defect.
+- The ext triage subprocess has its own 5s budget
+  (`PI_SKILL_EXT_TRIAGE_TIMEOUT_MS`) so shutdown never blocks ~2x the skill
+  triage timeout.
+- Records with unparseable/missing timestamps are SKIPPED, not counted as
+  age-0 (they could inflate `fix`).
+- Destructive inference is banned: a flat `{ name, file_path }` call WITHOUT
+  an explicit action is rejected, never turned into `remove_file`; unknown
+  actions (`action: "foo"`) are rejected in both the operations-array and the
+  flat path; aliases (edit→patch, add→create, remove→delete) fold in both.
+- Tools claimed by >1 extension are flagged in `ExtensionUsage.ambiguous_tools`.
+ Slash-command-only extensions cannot have their use
+attributed from toolResults in v1; their `dusty` verdict says so and stays
+a human call.
 

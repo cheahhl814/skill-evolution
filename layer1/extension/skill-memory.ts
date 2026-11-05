@@ -163,7 +163,7 @@ function recordToolUsage(toolName: string, rawInput: unknown): void {
 			return;
 		}
 		if (toolName === "skill_manage") {
-			const ops = Array.isArray(input.operations) ? (input.operations as Record<string, unknown>[]) : [];
+			const ops = inferOps(input as unknown);
 			for (const op of ops) {
 				const name = typeof op.name === "string" ? op.name : "";
 				const action = typeof op.action === "string" ? op.action : "";
@@ -204,6 +204,10 @@ function recordToolUsage(toolName: string, rawInput: unknown): void {
 // /reload does not spam the digest directory.
 
 const TRIAGE_ON_SHUTDOWN = process.env.PI_SKILL_TRIAGE_ON_SHUTDOWN !== "0";
+// M1 (review): the ext triage gets its own, shorter budget so a shutdown never
+// blocks ~2x TRIAGE_TIMEOUT_MS worth of spawnSync.
+const EXT_TRIAGE_TIMEOUT_MS = Number(process.env.PI_SKILL_EXT_TRIAGE_TIMEOUT_MS ?? "5000");
+const EXT_TRIAGE_ON_SHUTDOWN = process.env.PI_SKILL_EXT_TRIAGE_ON_SHUTDOWN !== "0";
 const TRIAGE_TIMEOUT_MS = Number(process.env.PI_SKILL_TRIAGE_TIMEOUT_MS ?? "15000");
 const TRIAGE_TOP = Number(process.env.PI_SKILL_TRIAGE_TOP ?? "10");
 const DIGEST_DIR =
@@ -236,6 +240,29 @@ function resolveEvolutionRoot(): string | null {
 	return null;
 }
 
+/** Run `python -m evolution.monitor.ext_triage --md`. Returns null on any failure. */
+function runExtTriage(root: string): string | null {
+	const venvPython = path.join(root, ".venv", "bin", "python");
+	const python = fs.existsSync(venvPython) ? venvPython : "python3";
+	try {
+		const res = spawnSync(
+			python,
+			["-m", "evolution.monitor.ext_triage", "--md"],
+			{
+				cwd: root,
+				env: { ...process.env, PYTHONPATH: root },
+				encoding: "utf8",
+				timeout: TRIAGE_TIMEOUT_MS,
+				maxBuffer: 1024 * 1024,
+			},
+		);
+		if (res.status !== 0 || !res.stdout) return null;
+		return res.stdout.trim();
+	} catch {
+		return null;
+	}
+}
+
 /** Run `python -m evolution.monitor.triage --json`. Returns null on any failure. */
 function runTriage(root: string): TriageRow[] | null {
 	const venvPython = path.join(root, ".venv", "bin", "python");
@@ -248,7 +275,7 @@ function runTriage(root: string): TriageRow[] | null {
 				cwd: root,
 				env: { ...process.env, PYTHONPATH: root },
 				encoding: "utf8",
-				timeout: TRIAGE_TIMEOUT_MS,
+				timeout: EXT_TRIAGE_TIMEOUT_MS,
 				maxBuffer: 8 * 1024 * 1024,
 			},
 		);
@@ -360,6 +387,17 @@ function writeDigest(rows: TriageRow[], counts: { skills: number; loaded: number
 			);
 		});
 		lines.push("");
+		// Layer-3: extension triage (post-hoc session mining; never breaks the digest)
+		if (EXT_TRIAGE_ON_SHUTDOWN) {
+			const evoRoot = resolveEvolutionRoot();
+			const extMd = evoRoot ? runExtTriage(evoRoot) : null;
+			if (extMd) {
+				lines.push("### Extensions (post-hoc, 30d)");
+				lines.push("");
+				lines.push(extMd);
+				lines.push("");
+			}
+		}
 		const section = lines.join("\n");
 
 		fs.mkdirSync(DIGEST_DIR, { recursive: true });
@@ -912,7 +950,9 @@ const SKILL_MANAGE_DESCRIPTION =
 	"the user before creating a new one.";
 
 const SkillManageParams = Type.Object({
-	operations: Type.Array(
+	// B1 (review): optional, so the flat single-op shorthand validates — inferOps()
+	// normalizes it; without this, flat calls fail schema validation before inferOps runs.
+	operations: Type.Optional(Type.Array(
 		Type.Union([
 			Type.Object({
 				action: StringEnum(["create"] as const),
@@ -940,8 +980,116 @@ const SkillManageParams = Type.Object({
 			Type.Object({ action: StringEnum(["delete"] as const), name: Type.String() }),
 		]),
 		{ description: "Ordered ops, applied atomically as one unit" },
-	),
+	)),
+	// Flat single-op shorthand (observed failure class: callers send name / old_string /
+	// new_string / content at the top level instead of inside an operations array).
+	// The handler normalizes via inferOps(); operations stays optional so that
+	// the shorthand validates.
+	name: Type.Optional(Type.String({ description: "Flat-shorthand: single-op target skill name" })),
+	action: Type.Optional(Type.String({ description: "Flat-shorthand: create/patch/write_file/remove_file/delete; aliases edit→patch, add→create, remove→delete" })),
+	file_path: Type.Optional(Type.String({ description: "Flat-shorthand: supporting file relative to skill dir" })),
+	content: Type.Optional(Type.String({ description: "Flat-shorthand: file content for create/write_file" })),
+	old_string: Type.Optional(Type.String({ description: "Flat-shorthand: exact text to replace (implies patch)" })),
+	new_string: Type.Optional(Type.String({ description: "Flat-shorthand: patch replacement; empty string deletes the match" })),
 });
+
+interface ManageOp {
+	action: string;
+	name: string;
+	content?: string;
+	file_path?: string;
+	old_string?: string;
+	new_string?: string;
+}
+
+const ACTION_ALIASES: Record<string, string> = {
+	edit: "patch",
+	modify: "patch",
+	update: "patch",
+	add: "create",
+	new: "create",
+	remove: "delete",
+	rm: "delete",
+};
+
+/**
+ * Normalize a call into the canonical operations list.
+ *
+ * Accepts the canonical { operations: [...] } form AND the flat single-op
+ * shorthand that agents repeatedly send (the observed 7-failure class):
+ * { name, content } / { name, old_string, new_string } / { name, file_path, content }.
+ * An explicit per-op action wins; otherwise it is inferred from the fields
+ * present (old_string → patch, file_path+content → write_file, content →
+ * create, file_path alone → remove_file). Unknown/ambiguous input returns []
+ * and the caller raises a helpful error. Action alias typos (edit/update →
+ * patch, add/new → create, remove/rm → delete) are folded here too.
+ */
+const VALID_ACTIONS = new Set(["create", "patch", "write_file", "remove_file", "delete"]);
+
+/** Fold common action typos; H2 (review): applies to canonical ops too. */
+function normalizeAction(raw: string): string {
+	const k = raw.trim().toLowerCase();
+	return ACTION_ALIASES[k] ?? k;
+}
+
+/**
+ * Normalize a call into the canonical operations list.
+ *
+ * Accepts the canonical { operations: [...] } form AND the flat single-op
+ * shorthand that agents repeatedly send (the observed 7-failure class):
+ * { name, content } / { name, old_string, new_string } / { name, file_path, content }.
+ *
+ * H2 (review): every entry — canonical or flat — gets its action alias-folded
+ * and validated against the five valid values; unknown/ambiguous input returns
+ * [] and the caller raises a helpful error. Action aliases: edit/update/modify
+ * → patch, add/new → create, remove/rm → delete.
+ *
+ * H1 (review): destructive actions (remove_file, delete) are NEVER inferred —
+ * they require an explicit action, so a flat { name, file_path } call errors
+ * instead of silently deleting a skill's SKILL.md.
+ */
+function inferOps(input: unknown): ManageOp[] {
+	if (!input || typeof input !== "object") return [];
+	const flat = input as Record<string, unknown>;
+	if (Array.isArray(flat.operations)) {
+		const ops: ManageOp[] = [];
+		for (const raw of flat.operations) {
+			if (!raw || typeof raw !== "object") return [];
+			const r = raw as Record<string, unknown>;
+			const name = typeof r.name === "string" ? r.name : "";
+			const action = typeof r.action === "string" ? normalizeAction(r.action) : "";
+			if (!name || !VALID_ACTIONS.has(action)) return [];
+			ops.push({ ...(raw as object), action, name } as ManageOp);
+		}
+		return ops;
+	}
+	const name = typeof flat.name === "string" ? flat.name : "";
+	if (!name) return [];
+	const content = typeof flat.content === "string" ? flat.content : undefined;
+	const file_path = typeof flat.file_path === "string" ? flat.file_path : undefined;
+	const old_string = typeof flat.old_string === "string" ? flat.old_string : undefined;
+	const hasNew = flat.new_string !== undefined && flat.new_string !== null;
+	const rawAction = typeof flat.action === "string" ? flat.action : "";
+	let action = rawAction ? normalizeAction(rawAction) : "";
+	if (!action) {
+		if (old_string !== undefined) action = "patch";
+		else if (file_path !== undefined && content !== undefined) action = "write_file";
+		else if (content !== undefined) action = "create";
+		// H1: file_path alone is NOT enough to infer remove_file.
+	}
+	if (!action || !VALID_ACTIONS.has(action)) return [];
+	if ((action === "remove_file" || action === "delete") && rawAction === "") return [];
+	const op: ManageOp = { action, name };
+	if (action === "create" && content !== undefined) op.content = content;
+	if (file_path !== undefined) op.file_path = file_path;
+	if (action === "patch") {
+		if (old_string === undefined) return [];
+		op.old_string = old_string;
+		op.new_string = hasNew ? String(flat.new_string) : "";
+	}
+	if (action === "write_file" && content === undefined) return [];
+	return [op];
+}
 
 interface OpLog {
 	action: string;
@@ -1095,15 +1243,27 @@ export default function skillMemoryExtension(pi: ExtensionAPI) {
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const logs: OpLog[] = [];
 			const snapshots = new Map<string, Snap>();
+			// LOW (review): compute opsList once, outside the try, so the error path
+			// reports a real count without re-running inferOps in an IIFE.
+			const opsListPre = inferOps(params);
 			try {
+				// Normalize the canonical operations array OR the flat single-op shorthand.
+				const opsList = opsListPre;
+				if (opsList.length === 0) {
+					throw new Error(
+						'skill_manage: pass { operations: [{ action, name, ... }] } or the flat shorthand '
+							+ "{ name, content } | { name, old_string, new_string } | { name, file_path, content }. "
+							+ 'Valid actions: create | patch | write_file | remove_file | delete.',
+					);
+				}
 				// ── 1. Pre-flight: resolve every target, snapshot all affected trees
 				const touchedRoots = new Set<string>();
-				const planned: { op: (typeof params.operations)[number]; target: string; skillDir: string; root: string }[] = [];
+				const planned: { op: ManageOp; target: string; skillDir: string; root: string }[] = [];
 				// A `create` in this batch makes its skill dir a legal target for the
 				// `write_file` ops that follow it (a new skill ships its README.md
 				// the same way). Ops are applied in order, so the create lands first.
 				const pendingCreates = new Map<string, { skillDir: string; root: string }>();
-				for (const op of params.operations) {
+				for (const op of opsList) {
 					const found = findSkill(op.name);
 					if (op.action === "create") {
 						if (found) throw new Error(`create: skill '${op.name}' already exists at ${found.entry}`);
@@ -1157,7 +1317,7 @@ export default function skillMemoryExtension(pi: ExtensionAPI) {
 				//        skill must also pass skill-forge's linter before
 				//        anything is written.
 				const createPlans = collectCreatePlans(
-					params.operations as { action: string; name: string; content?: string; file_path?: string }[],
+					opsList as { action: string; name: string; content?: string; file_path?: string }[],
 				);
 				const creatingNames = new Set(createPlans.map((p) => p.name));
 				// A revision is a write to an EXISTING skill. Ops that belong to
@@ -1165,7 +1325,7 @@ export default function skillMemoryExtension(pi: ExtensionAPI) {
 				// separate revision.
 				const revisionTargets = [
 					...new Set(
-						params.operations
+						opsList
 							.filter(
 								(op) =>
 									(op.action === "patch" || op.action === "write_file" || op.action === "remove_file") &&
@@ -1284,7 +1444,7 @@ export default function skillMemoryExtension(pi: ExtensionAPI) {
 				const msg = err instanceof Error ? err.message : String(err);
 				return {
 					content: [{ type: "text", text: `skill_manage FAILED (nothing applied, atomic rollback): ${msg}` }],
-					details: { ok: false, error: msg, opsPlanned: params.operations.length, logs },
+					details: { ok: false, error: msg, opsPlanned: opsListPre.length, logs },
 				};
 			}
 		},
