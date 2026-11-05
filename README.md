@@ -1,4 +1,4 @@
-# 🧬 skill-evolution — the two-layer self-improvement skill for Pi
+# 🧬 skill-evolution — the three-layer self-improvement system for Pi
 
 Offline evolutionary optimization of **Pi agent skills** (`SKILL.md` bodies)
 using **DSPy + GEPA** — a port of the Hermes-agent-self-evolution architecture
@@ -9,16 +9,18 @@ simultaneously the skill (`~/.agents/skills/skill-evolution` symlink → this
 tree), the Python package, the git repo, and the home of the Pi extension
 (`~/.pi/agent/extensions/skill-memory.ts` symlink → `layer1/extension/`).
 
-## The two layers
+## The three layers
 
 | Layer | What | Where | When |
 | --- | --- | --- | --- |
 | **Layer 1** | `skill_manage` tool: create / patch / write_file / remove_file / delete skills atomically, with guardrails (name regex, escape guard, frontmatter contract, 15KB cap, unique-patch match, snapshot+rollback, symlink-aware delete). Injects the skills-first routing prompt; one learning nudge per session; **records per-skill usage telemetry**; **writes a triage digest at session end**; **suggests the ranked next target in the prompt**. Every skill write is gated twice: an **accumulated-experience bar** and the **user's approval**. | `layer1/extension/skill-memory.ts` | in-session, live |
 | **Monitor** | Reads the telemetry, ranks skills by `usage × potential`, prints the next action per skill (`measure` / `evolve` / `shrink` / `stabilize` / `review`). No model calls. | `evolution/monitor/`, `bin/triage` | offline, on demand |
 | **Layer 2** | DSPy + GEPA optimizer over a skill's `SKILL.md` body: eval data from sessions / golden JSONL / synthetic, constraint gates, structural lint gate, human-reviewed local-branch deployment. | `evolution/`, `bin/evolve`, `datasets/`, `tests/` | offline, on demand |
+| **Layer 3** | Extension monitor: the same monitoring for **Pi extensions** — `ext_registry` inventories deployments (symlink-resolved, repo-rooted, regex+curated tool extraction), `ext_usage` attributes `toolResult` records from session JSONLs post-hoc (zero runtime hooks), `ext_triage` ranks (`fix` for ≥2 attributed errors → patch the source repo on a review branch; `watch` for 1 possible-noise error; `dusty` for zero calls; `inherent` for hook/UI-only). | `evolution/monitor/ext_*.py`, `bin/triage --extensions` | offline, on demand + digest section |
 
 Both layers ship from this one repo, so a runtime fix and an optimizer change
-are reviewed and released together.
+are reviewed and released together. Layer 3 reads the same session history any
+harness already writes — extensions need no instrumentation to be monitored.
 
 ## Contents
 
@@ -33,7 +35,7 @@ are reviewed and released together.
 | `references/layer1-write-policy.md` | Full reference: what `skill_manage` may write — the accumulated-experience bar, the user-approval gate, the skill-forge lint gate, the direct-edit gate, knobs, failure signatures |
 | `references/layer2-procedure.md` | Full reference: the eight-step offline evolution procedure (dry-run → ask-user gate → run → honest interpretation → review/merge → branch check → smoke → verify) |
 | `evolution/` | The Python package (config, constraints, dataset builders, fitness, CLI) |
-| `evolution/monitor/` | Telemetry reader + triage ranking (upstream Hermes leaves this a placeholder) |
+| `evolution/monitor/` | Telemetry reader + triage ranking (upstream Hermes leaves this a placeholder) + the Layer-3 extension registry/usage/triage (`ext_registry.py`, `ext_usage.py`, `ext_triage.py`) |
 | `bin/evolve` | CLI wrapper — the optimizer |
 | `bin/triage` | CLI wrapper — "which skill should I evolve first?" (read-only, no cost) |
 | `bin/smoke-candidate` | Command smoke gate — extracts the skill's shell commands, runs the allowlisted ones, fails the candidate if any of them break |

@@ -1,8 +1,8 @@
 ---
 name: skill-evolution
 description: 'Two-layer skill self-improvement for Pi: Layer 1 runtime (the skill_manage extension that patches skills in-session behind an accumulated-experience bar and user approval, records per-skill usage telemetry, writes a triage digest at session end, and suggests the ranked next target in the prompt) and Layer 2 offline optimizer (DSPy+GEPA over SKILL.md bodies) with a monitor/triage step that ranks which skill to evolve first. Mine session history or golden JSONL into eval data, evolve the skill body under constraint gates (15KB cap, ≤1.2x growth, frontmatter contract, lint gate), and deploy as a local evolve/ branch for human review — never pushes. Use when asked to "optimize/evolve a skill", "improve a SKILL.md offline", "run layer-2", "which skill should I evolve", "triage digest", "pi-skill-evolution", "skill evolution", or about the skill_manage runtime layer. Always dry-run first; ask-user gate before any model spend; report +0.000 outcomes as honest no-ops.'
-version: 1.7.0
-updated: "2026-10-28"
+version: 1.8.0
+updated: "2026-11-05"
 triggers:
   - "evolve a skill"
   - "optimize skill"
@@ -35,6 +35,7 @@ together, and a Layer-1 patch is a Layer-2 evolution target.
 | --- | --- | --- | --- |
 | **Layer 1** | `skill_manage` — writes/patches/deletes skills under guardrails; injects the skills-first routing prompt; one learning nudge per session; **records per-skill usage telemetry** | `layer1/extension/skill-memory.ts` (deployed as a symlink into `~/.pi/agent/extensions/`) | in-session, live |
 | **Monitor** | Reads the telemetry, ranks skills by `usage × potential`, and says what to do next (`measure` / `evolve` / `shrink` / `stabilize` / `review`) | `evolution/monitor/`, `bin/triage` | offline, on demand |
+| **Layer 3** | Extension monitor: inventories deployed extensions (symlink-resolved, repo-rooted), attributes session `toolResult` calls + errors post-hoc, ranks them `fix` / `watch` / `healthy` / `dusty` / `inherent`; zero new runtime hooks; a `fix` patches the source repo on a review branch | `evolution/monitor/ext_*.py`, `bin/triage --extensions` | offline, on demand + digest section |
 | **Layer 2** | DSPy + GEPA optimizer over a skill's `SKILL.md` body, with eval data, constraint gates and a structural lint gate | `evolution/` package, `bin/evolve`, `datasets/`, `tests/` | offline, on demand |
 
 Layer 1 handles skill CREATION and PATCHES during a session. Layer 2 is
@@ -111,8 +112,9 @@ linter in a temp staging dir. Policy, knobs, failure signatures:
 
 On `session_shutdown` the extension runs the monitor and appends a digest
 (`~/.local/share/skill-evolution/digests/YYYY-MM-DD.md` + `latest.md`): zero
-model calls, skipped on `/reload`, one section per session, 30-day pruning.
-Format: `layer1/digest-schema.md`.
+model calls, skipped on `/reload`, one section per session, 30-day pruning,
+plus an `### Extensions (post-hoc, 30d)` subsection (`ext_triage --md`; skip
+with `PI_SKILL_EXT_TRIAGE_ON_SHUTDOWN=0`). Format: `layer1/digest-schema.md`.
 
 ## Monitor + triage — pick the target before spending tokens
 
@@ -129,18 +131,15 @@ managed 0.8, read 0.6, failed 1.5); `potential` = estimated payoff.
 | installed, never used | 0.35 | `review` — fix the trigger description or prune it |
 
 `measure` deliberately outranks `evolve`: a used-but-unmeasured skill cannot
-be evolved responsibly yet. This is the port of Hermes' Phase-5 auto-triage
-("rank by potential improvement × usage frequency"), which upstream still
-leaves a placeholder.
+be evolved responsibly yet. `bin/triage --extensions` runs the Layer-3 ranking
+(hook/UI extensions are `inherent` — they fire every session, dust is
+meaningless). Details: `references/monitor-and-digest.md` §6.
 
 ## Extension suggests, agent acts
 
-The extension computes one suggestion per session
-(`evolution.monitor.triage --suggest` → the highest-priority actionable
-target) and injects it into the `skill_memory` prompt section, so the agent
-knows what the digest ranks next. It is a pointer, not an action: nothing is
-spent and `review` targets are never suggested. Knobs and the exact prompt
-text: `references/monitor-and-digest.md` §5.
+One suggestion per session (`--suggest` → highest-priority actionable target)
+is injected into the `skill_memory` prompt. Pointer only — nothing is spent;
+`review`/`dusty` targets are never suggested. `references/monitor-and-digest.md` §5.
 
 ## Layer 2 — invocation
 
@@ -185,17 +184,12 @@ each:
 
 ## Signature library — known failure signatures
 
-The six that bite most often; the full catalogue (every known signature, with
-cause and fix) is in `references/signature-library.md`.
-
-| Signature | Likely cause | Fix |
-| --- | --- | --- |
-| `mined 0 relevant session pair(s)` for an obviously-used skill | Miner token/parse regression | Run `pytest tests/ -q`; read `evolution/core/pi_sessions.py` — a char-join bug (" ".join over one string) shipped exactly this once. Fixed; trust tests |
-| `TypeError: cannot unpack non-iterable SessionPair object` | Dataset builder unpacks old triples post-redesign | Consume `pair.user_text` fields; see `evolution/core/dataset_builder.py`. Fixed 2026-10 (regression-tested) |
-| Layer-1 extension not in the live tool list | `~/.pi/agent/extensions/skill-memory.ts` is a stale copy or a broken symlink | The live file must be a symlink into `layer1/extension/`; fix the link, then `/reload` (or restart) — never keep a second copy |
-| Candidate beats the baseline but a command in it does not run | Lint passed; the proxy metric cannot execute anything | Run `bin/smoke-candidate <candidate>` (or the run with `--smoke`): a command like `date -d "2024-03-15" +%V / %G` fails with `extra operand '/'`. Reject the candidate |
-| Candidate scores higher but only adds a ritual (a fixed opening sentence, "list the command and its output") and deletes worked examples | The keyword-overlap proxy is being gamed, not the skill being improved | Re-score the baseline, the candidate and a ritual-free version: if only the ritual version wins, the gain is an artifact — drop it and fix the metric |
-| Baseline `size_limit: exceeded` (e.g. 25KB) | Target skill genuinely over the 15KB cap | Evolve anyway (shrink is the goal) but expect deploy-gate friction; or set `PI_EVOLUTION_MAX_SKILL` to size the target honestly |
+The full catalogue (signature → cause → fix, including miner regressions,
+ritual-gaming re-scores, stale deployment symlinks) lives in
+`references/signature-library.md`. Two universal rules: lint-passed ≠
+runnable (`bin/smoke-candidate`), and a proxy-metric win that adds ritual
+text and deletes worked examples is gaming, not improvement — re-score with
+the rubric judge before believing it.
 
 ## Constants / knobs
 
